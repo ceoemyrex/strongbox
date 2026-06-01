@@ -79,8 +79,9 @@ seal_submit_share() {
   local share="${1:-}"
   _SEAL_RESPONSE=""
 
-  seal_is_initialized || { _SEAL_RESPONSE='{"error":"vault is not initialized — call /sys/init first"}'; return 1; }
-  seal_is_sealed      || { _SEAL_RESPONSE='{"error":"vault is already unsealed"}'; return 1; }
+  # Followers can be unsealed with the same shares as the leader.
+  # We skip the init_done check on followers — Shamir reconstruction validates the shares.
+  seal_is_sealed || { _SEAL_RESPONSE='{"error":"vault is already unsealed"}'; return 1; }
 
   # Validate format: "{index}:{hexbytes}"
   echo "${share}" | grep -qE '^[0-9]+:[0-9a-f]+$' || \

@@ -104,8 +104,10 @@ _http_route() {
     esac
   fi
 
-  # Leader gate: writes on a non-leader node → 307 (redirect) or 503 (no quorum)
-  # Exempted: seal/unseal endpoints and internal consensus paths
+  # Leader gate: writes on a non-leader → 307 redirect or 503 (no quorum).
+  # Leader also checks quorum: a partitioned leader refuses writes rather than
+  # accepting them in a minority partition (Raft safety rule).
+  # Exempted: seal/unseal endpoints and internal consensus paths.
   case "${method}" in
     PUT|POST|DELETE)
       case "${path}" in
@@ -116,6 +118,9 @@ _http_route() {
             consensus_quorum_reachable 2>/dev/null || { http_error 503 "minority partition — writes refused"; return; }
             http_json 307 "$(printf '{"error":"not leader","leader":"%s"}' "$(consensus_leader_hint 2>/dev/null)")"
             return
+          else
+            # Even the leader checks quorum — refuse writes when partitioned
+            consensus_quorum_reachable 2>/dev/null || { http_error 503 "minority partition — writes refused"; return; }
           fi ;;
       esac ;;
   esac

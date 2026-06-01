@@ -22,6 +22,8 @@ audit_init() {
 
 audit_append() {
   local token_id="$1" op="$2" path="$3"
+  # Fall back to env vars when audit_init wasn't called (ncat-forked handler subprocesses)
+  [[ -z "${_AUDIT_LOG_FILE}" ]] && _AUDIT_LOG_FILE="${STRONGBOX_AUDIT_LOG_FILE:-}"
   [[ -z "${_AUDIT_LOG_FILE}" ]] && return 0
   [[ -z "${_AUDIT_HMAC_KEY}" ]] && _AUDIT_HMAC_KEY="${STRONGBOX_AUDIT_HMAC_KEY:-}"
   [[ -z "${_AUDIT_HMAC_KEY}" ]] && return 0
@@ -86,6 +88,7 @@ audit_verify() {
 # Returns all entries as a JSON array, optionally filtered by token_id
 audit_query() {
   local filter_token="${1:-}"
+  [[ -z "${_AUDIT_LOG_FILE}" ]] && _AUDIT_LOG_FILE="${STRONGBOX_AUDIT_LOG_FILE:-}"
   [[ -z "${_AUDIT_LOG_FILE}" || ! -f "${_AUDIT_LOG_FILE}" ]] && { echo '[]'; return; }
 
   local results=()

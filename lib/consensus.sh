@@ -59,7 +59,7 @@ consensus_quorum_reachable() {
   local reachable=1  # count self
   for peer in "${_PEERS[@]}"; do
     [[ -z "${peer}" ]] && continue
-    curl -sf --max-time 0.2 "${peer}/v1/sys/health" >/dev/null 2>&1 && reachable=$(( reachable + 1 ))
+    curl -sf --max-time 1.0 "${peer}/v1/sys/health" >/dev/null 2>&1 && reachable=$(( reachable + 1 ))
   done
   local total=$(( ${#_PEERS[@]} + 1 ))
   [[ "${reachable}" -ge $(( total / 2 + 1 )) ]]
@@ -83,7 +83,11 @@ _consensus_election_loop() {
       local tms=$(( (RANDOM % range) + _ELECTION_TIMEOUT_MIN_MS ))
       sleep "$(echo "scale=3; ${tms}/1000" | bc)"
       local now last_hb; now="$(_now_ms)"; last_hb="$(_cs_read last_hb)"; last_hb="${last_hb:-0}"
-      if (( now - last_hb >= tms )); then _consensus_start_election; fi
+      # Only start an election if the vault is unsealed — a sealed node cannot
+      # serve write requests, so electing it as leader would break the cluster.
+      if (( now - last_hb >= tms )) && crypto_is_unsealed; then
+        _consensus_start_election
+      fi
     fi
   done
 }
@@ -124,7 +128,8 @@ _consensus_send_heartbeats() {
 
 _CONSENSUS_RESPONSE=""  # written by handlers, read back by http.sh
 
-# Grants vote if requester's term is higher and we haven't voted this term
+# Grants vote only if unsealed and requester's term is higher than our current term.
+# Sealed nodes refuse to vote — they cannot serve as leader.
 consensus_handle_vote() {
   local req="$1"
   local term; term="$(echo "${req}" | grep -o '"term":[0-9]*' | cut -d: -f2)"
@@ -132,6 +137,11 @@ consensus_handle_vote() {
   local cur; cur="$(_cs_read term)"
   local vf; vf="$(_cs_read voted_for)"
   local granted=false
+
+  if seal_is_sealed; then
+    _CONSENSUS_RESPONSE="$(printf '{"term":%d,"granted":false}' "${cur}")"
+    return
+  fi
 
   if (( term > cur )) && { [[ -z "${vf}" ]] || [[ "${vf}" == "${cid}" ]]; }; then
     _cs_write term "${term}"; _cs_write voted_for "${cid}"; _cs_write role "follower"
