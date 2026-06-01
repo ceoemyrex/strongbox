@@ -37,10 +37,10 @@ def _gf_init() -> None:
     for i in range(255):
         _GF_EXP[i] = x
         _GF_LOG[x] = i
-        x <<= 1
-        if x & 0x100:
-            x ^= 0x11b
-    for i in range(255, 512):
+        x ^= (x << 1) ^ (0x1b if (x >> 7) & 1 else 0)
+        x &= 0xFF
+    _GF_EXP[255] = _GF_EXP[0]
+    for i in range(256, 512):
         _GF_EXP[i] = _GF_EXP[i - 255]
 
 _gf_init()
