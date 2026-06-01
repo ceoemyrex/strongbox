@@ -3,11 +3,9 @@
 #
 # Every read, write, auth event, and lease event is appended as a JSON line.
 # Each entry includes a hash over (index|ts|token_id|op|path|prev_hash),
-# HMAC'd with a key derived from the KEK. This means:
-#   - The chain is only verifiable when the cluster is unsealed (stronger model).
-#   - A re-seal + re-unseal with a different KEK would break historical verification.
-#   - Any single-byte modification to any entry will cause verify to exit non-zero
-#     and name the corrupted entry by index.
+# HMAC'd with STRONGBOX_AUDIT_HMAC_KEY. The verifier uses the same env var.
+# Any single-byte modification causes verify to exit non-zero and name the
+# corrupted entry by index.
 #
 # Public interface:
 #   audit_init    <log_file>                  → sets log path, derives HMAC key
@@ -26,10 +24,20 @@ audit_init() {
   _AUDIT_LOG_FILE="${1}"
   mkdir -p "$(dirname "${_AUDIT_LOG_FILE}")"
 
-  # Derive HMAC key from KEK using HKDF-like construction.
-  # _STRONGBOX_KEK is set by crypto.sh after unseal.
-  _AUDIT_HMAC_KEY="$(printf '%s' "strongbox-audit-hmac-v1:${_STRONGBOX_KEK}" \
-    | openssl dgst -sha256 | awk '{print $2}')"
+  _AUDIT_HMAC_KEY="${STRONGBOX_AUDIT_HMAC_KEY:-}"
+  if [[ -z "${_AUDIT_HMAC_KEY}" ]]; then
+    echo "warning: STRONGBOX_AUDIT_HMAC_KEY not set; using process-local audit key" >&2
+    _AUDIT_HMAC_KEY="$(openssl rand -hex 32)"
+  fi
+
+  _AUDIT_PREV_HASH="0000000000000000000000000000000000000000000000000000000000000000"
+  _AUDIT_INDEX=0
+  if [[ -s "${_AUDIT_LOG_FILE}" ]]; then
+    local last_line
+    last_line="$(tail -n 1 "${_AUDIT_LOG_FILE}")"
+    _AUDIT_INDEX="$(echo "${last_line}" | grep -o '"index":[0-9]*' | cut -d: -f2)"
+    _AUDIT_PREV_HASH="$(echo "${last_line}" | grep -o '"hmac":"[^"]*"' | cut -d\" -f4)"
+  fi
 }
 
 audit_append() {
@@ -57,18 +65,38 @@ audit_append() {
 
 audit_verify() {
   local log_file="${1}"
+  _AUDIT_HMAC_KEY="${STRONGBOX_AUDIT_HMAC_KEY:-}"
+  if [[ -z "${_AUDIT_HMAC_KEY}" ]]; then
+    echo "error: STRONGBOX_AUDIT_HMAC_KEY is required for verification" >&2
+    return 2
+  fi
+
   local prev_hash="0000000000000000000000000000000000000000000000000000000000000000"
-  local all_ok=true
+  local line_number=0
 
   while IFS= read -r line; do
-    local index ts token_id op path stored_hmac expected_hmac payload
+    line_number=$(( line_number + 1 ))
+    local index ts token_id op path stored_prev_hash stored_hmac expected_hmac payload
 
     index="$(echo "${line}"    | grep -o '"index":[0-9]*'        | cut -d: -f2)"
     ts="$(echo "${line}"       | grep -o '"ts":"[^"]*"'          | cut -d\" -f4)"
     token_id="$(echo "${line}" | grep -o '"token_id":"[^"]*"'    | cut -d\" -f4)"
     op="$(echo "${line}"       | grep -o '"op":"[^"]*"'          | cut -d\" -f4)"
     path="$(echo "${line}"     | grep -o '"path":"[^"]*"'        | cut -d\" -f4)"
+    stored_prev_hash="$(echo "${line}" | grep -o '"prev_hash":"[^"]*"' | cut -d\" -f4)"
     stored_hmac="$(echo "${line}" | grep -o '"hmac":"[^"]*"'     | cut -d\" -f4)"
+    [[ -z "${index}" ]] && index="${line_number}"
+
+    if [[ -z "${ts}" || -z "${token_id}" || -z "${op}" || -z "${path}" || \
+          -z "${stored_prev_hash}" || -z "${stored_hmac}" ]]; then
+      echo "TAMPERED: audit entry index ${index}" >&2
+      return 1
+    fi
+
+    if [[ "${stored_prev_hash}" != "${prev_hash}" ]]; then
+      echo "TAMPERED: audit entry index ${index}" >&2
+      return 1
+    fi
 
     payload="$(printf '%s|%s|%s|%s|%s|%s' \
       "${index}" "${ts}" "${token_id}" "${op}" "${path}" "${prev_hash}")"
@@ -78,19 +106,14 @@ audit_verify() {
 
     if [[ "${stored_hmac}" != "${expected_hmac}" ]]; then
       echo "TAMPERED: audit entry index ${index}" >&2
-      all_ok=false
-      # Do not exit early — report all corrupted entries.
+      return 1
     fi
 
     prev_hash="${stored_hmac}"
   done < "${log_file}"
 
-  if ${all_ok}; then
-    echo "audit log intact (${_AUDIT_INDEX} entries verified)"
-    return 0
-  else
-    return 1
-  fi
+  echo "audit log intact (${line_number} entries verified)"
+  return 0
 }
 
 audit_query() {
