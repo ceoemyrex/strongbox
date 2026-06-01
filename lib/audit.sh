@@ -1,141 +1,96 @@
 #!/usr/bin/env bash
-# lib/audit.sh — tamper-evident HMAC-SHA256 audit chain
+# lib/audit.sh — tamper-evident HMAC-SHA256 chain
 #
-# Every read, write, auth event, and lease event is appended as a JSON line.
-# Each entry includes a hash over (index|ts|token_id|op|path|prev_hash),
-# HMAC'd with STRONGBOX_AUDIT_HMAC_KEY. The verifier uses the same env var.
-# Any single-byte modification causes verify to exit non-zero and name the
-# corrupted entry by index.
-#
-# Public interface:
-#   audit_init    <log_file>                  → sets log path, derives HMAC key
-#   audit_append  <token_id> <op> <path>      → appends one entry
-#   audit_verify  <log_file>                  → 0 intact / 1 corrupted (names entry)
-#   audit_query   <token_id>                  → JSON array of matching entries
+# Each entry hashes (index|ts|token_id|op|path|prev_hash) with a server key.
+# Uses flock for safe concurrent appends from ncat handlers.
 
 set -euo pipefail
 
 _AUDIT_LOG_FILE=""
 _AUDIT_HMAC_KEY=""
-_AUDIT_PREV_HASH="0000000000000000000000000000000000000000000000000000000000000000"
-_AUDIT_INDEX=0
 
 audit_init() {
-  _AUDIT_LOG_FILE="${1}"
+  _AUDIT_LOG_FILE="${1:-${STRONGBOX_AUDIT_LOG_FILE:-/var/log/strongbox/audit.log}}"
   mkdir -p "$(dirname "${_AUDIT_LOG_FILE}")"
-
   _AUDIT_HMAC_KEY="${STRONGBOX_AUDIT_HMAC_KEY:-}"
-  if [[ -z "${_AUDIT_HMAC_KEY}" ]]; then
-    echo "warning: STRONGBOX_AUDIT_HMAC_KEY not set; using process-local audit key" >&2
-    _AUDIT_HMAC_KEY="$(openssl rand -hex 32)"
-  fi
-
-  _AUDIT_PREV_HASH="0000000000000000000000000000000000000000000000000000000000000000"
-  _AUDIT_INDEX=0
-  if [[ -s "${_AUDIT_LOG_FILE}" ]]; then
-    local last_line
-    last_line="$(tail -n 1 "${_AUDIT_LOG_FILE}")"
-    _AUDIT_INDEX="$(echo "${last_line}" | grep -o '"index":[0-9]*' | cut -d: -f2)"
-    _AUDIT_PREV_HASH="$(echo "${last_line}" | grep -o '"hmac":"[^"]*"' | cut -d\" -f4)"
-  fi
+  [[ -z "${_AUDIT_HMAC_KEY}" ]] && _AUDIT_HMAC_KEY="$(openssl rand -hex 32)"
+  return 0
 }
 
 audit_append() {
-  local token_id="${1}" op="${2}" path="${3}"
+  local token_id="$1" op="$2" path="$3"
+  [[ -z "${_AUDIT_LOG_FILE}" ]] && return 0
+  [[ -z "${_AUDIT_HMAC_KEY}" ]] && _AUDIT_HMAC_KEY="${STRONGBOX_AUDIT_HMAC_KEY:-}"
+  [[ -z "${_AUDIT_HMAC_KEY}" ]] && return 0
+
   local ts; ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  _AUDIT_INDEX=$(( _AUDIT_INDEX + 1 ))
+  local prev_hash="0000000000000000000000000000000000000000000000000000000000000000"
+  local index=0
 
-  local payload
-  payload="$(printf '%d|%s|%s|%s|%s|%s' \
-    "${_AUDIT_INDEX}" "${ts}" "${token_id}" "${op}" "${path}" "${_AUDIT_PREV_HASH}")"
+  (
+    flock -x 200
+    if [[ -s "${_AUDIT_LOG_FILE}" ]]; then
+      local last_line; last_line="$(tail -n 1 "${_AUDIT_LOG_FILE}")"
+      index="$(echo "${last_line}" | grep -o '"index":[0-9]*' | cut -d: -f2)"
+      prev_hash="$(echo "${last_line}" | grep -o '"hmac":"[^"]*"' | cut -d\" -f4)"
+    fi
+    index=$(( index + 1 ))
 
-  local hmac
-  hmac="$(printf '%s' "${payload}" \
-    | openssl dgst -sha256 -hmac "${_AUDIT_HMAC_KEY}" | awk '{print $2}')"
+    local payload hmac
+    payload="$(printf '%d|%s|%s|%s|%s|%s' "${index}" "${ts}" "${token_id}" "${op}" "${path}" "${prev_hash}")"
+    hmac="$(printf '%s' "${payload}" | openssl dgst -sha256 -hmac "${_AUDIT_HMAC_KEY}" | awk '{print $2}')"
 
-  local entry
-  entry="$(printf \
-    '{"index":%d,"ts":"%s","token_id":"%s","op":"%s","path":"%s","prev_hash":"%s","hmac":"%s"}' \
-    "${_AUDIT_INDEX}" "${ts}" "${token_id}" "${op}" "${path}" \
-    "${_AUDIT_PREV_HASH}" "${hmac}")"
-
-  echo "${entry}" >> "${_AUDIT_LOG_FILE}"
-  _AUDIT_PREV_HASH="${hmac}"
+    printf '{"index":%d,"ts":"%s","token_id":"%s","op":"%s","path":"%s","prev_hash":"%s","hmac":"%s"}\n' \
+      "${index}" "${ts}" "${token_id}" "${op}" "${path}" "${prev_hash}" "${hmac}" >> "${_AUDIT_LOG_FILE}"
+  ) 200>"${_AUDIT_LOG_FILE}.lock"
 }
 
 audit_verify() {
-  local log_file="${1}"
+  local log_file="$1"
   _AUDIT_HMAC_KEY="${STRONGBOX_AUDIT_HMAC_KEY:-}"
-  if [[ -z "${_AUDIT_HMAC_KEY}" ]]; then
-    echo "error: STRONGBOX_AUDIT_HMAC_KEY is required for verification" >&2
-    return 2
-  fi
+  [[ -z "${_AUDIT_HMAC_KEY}" ]] && { echo "error: STRONGBOX_AUDIT_HMAC_KEY required" >&2; return 2; }
 
   local prev_hash="0000000000000000000000000000000000000000000000000000000000000000"
   local line_number=0
 
   while IFS= read -r line; do
     line_number=$(( line_number + 1 ))
-    local index ts token_id op path stored_prev_hash stored_hmac expected_hmac payload
-
-    index="$(echo "${line}"    | grep -o '"index":[0-9]*'        | cut -d: -f2)"
-    ts="$(echo "${line}"       | grep -o '"ts":"[^"]*"'          | cut -d\" -f4)"
-    token_id="$(echo "${line}" | grep -o '"token_id":"[^"]*"'    | cut -d\" -f4)"
-    op="$(echo "${line}"       | grep -o '"op":"[^"]*"'          | cut -d\" -f4)"
-    path="$(echo "${line}"     | grep -o '"path":"[^"]*"'        | cut -d\" -f4)"
-    stored_prev_hash="$(echo "${line}" | grep -o '"prev_hash":"[^"]*"' | cut -d\" -f4)"
-    stored_hmac="$(echo "${line}" | grep -o '"hmac":"[^"]*"'     | cut -d\" -f4)"
+    local index ts token_id op path stored_prev stored_hmac
+    index="$(echo "${line}" | grep -o '"index":[0-9]*' | cut -d: -f2)"
+    ts="$(echo "${line}" | grep -o '"ts":"[^"]*"' | cut -d\" -f4)"
+    token_id="$(echo "${line}" | grep -o '"token_id":"[^"]*"' | cut -d\" -f4)"
+    op="$(echo "${line}" | grep -o '"op":"[^"]*"' | cut -d\" -f4)"
+    path="$(echo "${line}" | grep -o '"path":"[^"]*"' | cut -d\" -f4)"
+    stored_prev="$(echo "${line}" | grep -o '"prev_hash":"[^"]*"' | cut -d\" -f4)"
+    stored_hmac="$(echo "${line}" | grep -o '"hmac":"[^"]*"' | cut -d\" -f4)"
     [[ -z "${index}" ]] && index="${line_number}"
 
-    if [[ -z "${ts}" || -z "${token_id}" || -z "${op}" || -z "${path}" || \
-          -z "${stored_prev_hash}" || -z "${stored_hmac}" ]]; then
-      echo "TAMPERED: audit entry index ${index}" >&2
-      return 1
-    fi
+    [[ "${stored_prev}" != "${prev_hash}" ]] && { echo "TAMPERED: audit entry index ${index}" >&2; return 1; }
 
-    if [[ "${stored_prev_hash}" != "${prev_hash}" ]]; then
-      echo "TAMPERED: audit entry index ${index}" >&2
-      return 1
-    fi
-
-    payload="$(printf '%s|%s|%s|%s|%s|%s' \
-      "${index}" "${ts}" "${token_id}" "${op}" "${path}" "${prev_hash}")"
-
-    expected_hmac="$(printf '%s' "${payload}" \
-      | openssl dgst -sha256 -hmac "${_AUDIT_HMAC_KEY}" | awk '{print $2}')"
-
-    if [[ "${stored_hmac}" != "${expected_hmac}" ]]; then
-      echo "TAMPERED: audit entry index ${index}" >&2
-      return 1
-    fi
+    local payload expected
+    payload="$(printf '%s|%s|%s|%s|%s|%s' "${index}" "${ts}" "${token_id}" "${op}" "${path}" "${prev_hash}")"
+    expected="$(printf '%s' "${payload}" | openssl dgst -sha256 -hmac "${_AUDIT_HMAC_KEY}" | awk '{print $2}')"
+    [[ "${stored_hmac}" != "${expected}" ]] && { echo "TAMPERED: audit entry index ${index}" >&2; return 1; }
 
     prev_hash="${stored_hmac}"
   done < "${log_file}"
 
   echo "audit log intact (${line_number} entries verified)"
-  return 0
 }
 
 audit_query() {
   local filter_token="${1:-}"
   [[ -z "${_AUDIT_LOG_FILE}" || ! -f "${_AUDIT_LOG_FILE}" ]] && { echo '[]'; return; }
 
-  local results=() line
+  local results=()
   while IFS= read -r line; do
-    if [[ -z "${filter_token}" || "${line}" == *"\"token_id\":\"${filter_token}\""* ]]; then
-      results+=("${line}")
-    fi
+    [[ -z "${filter_token}" || "${line}" == *"\"token_id\":\"${filter_token}\""* ]] && results+=("${line}")
   done < "${_AUDIT_LOG_FILE}"
 
-  local count="${#results[@]}"
-  if [[ "${count}" -eq 0 ]]; then
-    echo '[]'; return
-  fi
-
+  [[ "${#results[@]}" -eq 0 ]] && { echo '[]'; return; }
   printf '['
-  local i
-  for (( i = 0; i < count; i++ )); do
-    [[ "${i}" -gt 0 ]] && printf ','
+  local i; for (( i = 0; i < ${#results[@]}; i++ )); do
+    (( i > 0 )) && printf ','
     printf '%s' "${results[$i]}"
   done
   printf ']'

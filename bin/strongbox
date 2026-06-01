@@ -1,32 +1,54 @@
 #!/usr/bin/env bash
-# strongbox — main server entrypoint
-# Starts the HTTP server, initialises all subsystems, runs the reaper loop.
-set -euo pipefail
+set -uo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LIB_DIR="${SCRIPT_DIR}/../lib"
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LIB_DIR="${APP_DIR}/lib"
 
-source "${LIB_DIR}/seal.sh"
-source "${LIB_DIR}/crypto.sh"
-source "${LIB_DIR}/storage.sh"
-source "${LIB_DIR}/auth.sh"
-source "${LIB_DIR}/audit.sh"
-source "${LIB_DIR}/lease.sh"
-source "${LIB_DIR}/dynamic.sh"
-source "${LIB_DIR}/consensus.sh"
-source "${LIB_DIR}/http.sh"
+for module in storage crypto seal auth audit lease dynamic consensus http; do
+    [[ -f "${LIB_DIR}/${module}.sh" ]] && source "${LIB_DIR}/${module}.sh"
+done
 
-CONFIG_FILE="${SCRIPT_DIR}/../config.yaml"
+_NODE_ID="${STRONGBOX_NODE_ID:-node-1}"
+_HTTP_PORT="${STRONGBOX_PORT:-8200}"
+SEALED_FILE="${SEALED_FILE:-/data/sealed}"
+STORAGE_DIR="${STORAGE_DIR:-/dev/shm/strongbox/secrets}"
+AUDIT_LOG="${STRONGBOX_AUDIT_LOG_FILE:-/var/log/strongbox/audit.log}"
+AUDIT_HMAC_KEY_FILE="${AUDIT_HMAC_KEY_FILE:-$(dirname "${AUDIT_LOG}")/.audit-hmac-key}"
 
-# ── bootstrap ──────────────────────────────────────────────────────────────
+RUN_DIR="/dev/shm/strongbox"
+mkdir -p "${RUN_DIR}" 2>/dev/null || { RUN_DIR="/tmp/strongbox-run"; mkdir -p "${RUN_DIR}"; }
+
+export _NODE_ID _HTTP_PORT SEALED_FILE STORAGE_DIR RUN_DIR
+export STRONGBOX_NODE_ID="${_NODE_ID}"
+export STRONGBOX_PORT="${_HTTP_PORT}"
+export APP_DIR LIB_DIR
+
+mkdir -p "${STORAGE_DIR}" "$(dirname "${AUDIT_LOG}")" "/data"
+
 storage_init
-auth_init
-seal_init          # boots in sealed state; KEK = empty
-audit_init "${STRONGBOX_AUDIT_LOG_FILE:-/var/log/strongbox/audit.log}"
-consensus_init     # starts election timer; no writes until unsealed + leader
-lease_reaper_start # background loop; checks TTLs every LEASE_REAPER_INTERVAL
+audit_init "${AUDIT_LOG}"
 
-# ── main request loop ───────────────────────────────────────────────────────
-# http_serve blocks; dispatches each request to the correct handler.
-# All handlers receive: method, path, body, token (may be empty).
-http_serve
+if [[ -z "${STRONGBOX_AUDIT_HMAC_KEY:-}" ]]; then
+    if [[ -f "${AUDIT_HMAC_KEY_FILE}" ]]; then
+        STRONGBOX_AUDIT_HMAC_KEY="$(cat "${AUDIT_HMAC_KEY_FILE}")"
+    else
+        STRONGBOX_AUDIT_HMAC_KEY="$(openssl rand -hex 32)"
+        printf '%s' "${STRONGBOX_AUDIT_HMAC_KEY}" > "${AUDIT_HMAC_KEY_FILE}"
+        chmod 600 "${AUDIT_HMAC_KEY_FILE}" 2>/dev/null || true
+    fi
+fi
+export STRONGBOX_AUDIT_HMAC_KEY
+
+touch "${SEALED_FILE}"
+
+consensus_init
+_consensus_election_loop &
+disown
+
+lease_reaper_start
+
+echo "[$(date -u +%H:%M:%SZ)] strongbox ${_NODE_ID} listening on :${_HTTP_PORT}" >&2
+
+while true; do
+    ncat -l 0.0.0.0 "${_HTTP_PORT}" -k -c "${APP_DIR}/bin/http-handler"
+done

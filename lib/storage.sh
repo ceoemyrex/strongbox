@@ -1,85 +1,78 @@
 #!/usr/bin/env bash
-# lib/storage.sh — in-memory storage backend
-#
-# All secret access goes through this interface.
-# Swapping in a persistent backend (BoltDB, SQLite, etc.) means
-# replacing only this file — no other lib/ file touches _STORE directly.
-#
-# Public interface:
-#   storage_init
-#   storage_put    <path> <envelope>    → version number (integer)
-#   storage_get    <path> [version]     → envelope string, or error on stderr
-#   storage_latest_version <path>       → latest version number, or error
-#   storage_delete <path>               → 0, or error on stderr
-#   storage_list   <prefix>             → newline-separated paths
-
 set -euo pipefail
 
-# _STORE["path:N"]        = encrypted envelope for version N
-# _STORE_VERSION["path"]  = latest version number for path
-declare -A _STORE
-declare -A _STORE_VERSION
+STORAGE_DIR="${STORAGE_DIR:-/dev/shm/strongbox/secrets}"
 
-storage_init() {
-  _STORE=()
-  _STORE_VERSION=()
+storage_init() { mkdir -p "${STORAGE_DIR}"; }
+
+_safe_path() { printf '%s' "$1" | tr '/' '_'; }
+
+storage_kv_put() {
+  local safe; safe="$(_safe_path "$1")"
+  mkdir -p "${STORAGE_DIR}"
+  printf '%s' "$2" > "${STORAGE_DIR}/${safe}"
+}
+
+storage_kv_get() {
+  local safe; safe="$(_safe_path "$1")"
+  [[ -f "${STORAGE_DIR}/${safe}" ]] || return 1
+  cat "${STORAGE_DIR}/${safe}"
+}
+
+storage_kv_delete() {
+  local safe; safe="$(_safe_path "$1")"
+  rm -f "${STORAGE_DIR}/${safe}"
 }
 
 storage_put() {
-  local path="${1}" envelope="${2}"
-  local current="${_STORE_VERSION["${path}"]:-0}"
-  local version=$(( current + 1 ))
-  _STORE["${path}:${version}"]="${envelope}"
-  _STORE_VERSION["${path}"]="${version}"
-  echo "${version}"
+  local path="$1" envelope="$2"
+  local safe; safe="$(_safe_path "$path")"
+  mkdir -p "${STORAGE_DIR}"
+
+  local version=1
+  if [[ -f "${STORAGE_DIR}/${safe}.meta" ]]; then
+    version="$(cat "${STORAGE_DIR}/${safe}.meta")"
+    version=$(( version + 1 ))
+  fi
+
+  printf '%s' "$envelope" > "${STORAGE_DIR}/${safe}.v${version}"
+  printf '%s' "$envelope" > "${STORAGE_DIR}/${safe}"
+  printf '%s' "$version"  > "${STORAGE_DIR}/${safe}.meta"
+  echo "$version"
 }
 
 storage_get() {
-  local path="${1}" version="${2:-}"
+  local path="$1" version="${2:-}"
+  local safe; safe="$(_safe_path "$path")"
 
-  if [[ -z "${version}" ]]; then
-    version="${_STORE_VERSION["${path}"]:-}"
-    if [[ -z "${version}" ]]; then
-      echo '{"error":"secret not found"}' >&2; return 1
-    fi
+  if [[ -n "$version" && "$version" != "latest" ]]; then
+    [[ -f "${STORAGE_DIR}/${safe}.v${version}" ]] || { echo '{"error":"version not found"}' >&2; return 1; }
+    cat "${STORAGE_DIR}/${safe}.v${version}"
+    return 0
   fi
 
-  local envelope="${_STORE["${path}:${version}"]:-}"
-  if [[ -z "${envelope}" ]]; then
-    echo '{"error":"version not found"}' >&2; return 1
-  fi
-
-  echo "${envelope}"
+  [[ -f "${STORAGE_DIR}/${safe}" ]] || { echo '{"error":"secret not found"}' >&2; return 1; }
+  cat "${STORAGE_DIR}/${safe}"
 }
 
 storage_latest_version() {
-  local path="${1}"
-  local version="${_STORE_VERSION["${path}"]:-}"
-  if [[ -z "${version}" ]]; then
-    echo '{"error":"secret not found"}' >&2
-    return 1
-  fi
-  echo "${version}"
+  local safe; safe="$(_safe_path "$1")"
+  [[ -f "${STORAGE_DIR}/${safe}.meta" ]] || { echo "0"; return; }
+  cat "${STORAGE_DIR}/${safe}.meta"
 }
 
 storage_delete() {
-  local path="${1}"
-  local latest="${_STORE_VERSION["${path}"]:-}"
-  if [[ -z "${latest}" ]]; then
-    echo '{"error":"secret not found"}' >&2; return 1
-  fi
-
-  local v
-  for (( v = 1; v <= latest; v++ )); do
-    unset "_STORE[${path}:${v}]" 2>/dev/null || true
-  done
-  unset "_STORE_VERSION[${path}]"
+  local safe; safe="$(_safe_path "$1")"
+  rm -f "${STORAGE_DIR}/${safe}" "${STORAGE_DIR}/${safe}".v* "${STORAGE_DIR}/${safe}.meta"
 }
 
 storage_list() {
-  local prefix="${1:-}"
-  local key
-  for key in "${!_STORE_VERSION[@]}"; do
-    [[ -z "${prefix}" || "${key}" == "${prefix}"* ]] && echo "${key}"
+  local safe_prefix; safe_prefix="$(_safe_path "${1:-}")"
+  shopt -s nullglob
+  for f in "${STORAGE_DIR}/${safe_prefix}"*; do
+    local base; base="$(basename "$f")"
+    [[ "$base" == *.meta || "$base" == *.v* ]] && continue
+    printf '%s\n' "$base" | tr '_' '/'
   done
+  shopt -u nullglob
 }
