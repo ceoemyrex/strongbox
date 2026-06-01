@@ -278,6 +278,10 @@ echo "── memory hygiene (the heap-dump test) ──"
 # script's outer variables don't pollute the dump. Subshell state changes
 # (including the unseal) do not propagate to the parent — that is fine
 # because we only care about the in-subshell snapshot.
+FP_FILE_SEAL=$(mktemp)
+KEK_FILE_SEAL=$(mktemp)
+trap "rm -f $FP_FILE_SEAL $KEK_FILE_SEAL" EXIT
+
 HEAP_DUMP_RESULTS=$(
   # ─── 1. fresh init in this subshell ────────────────────────────────────
   seal_init
@@ -291,13 +295,15 @@ HEAP_DUMP_RESULTS=$(
   done <<< "$shares_raw"
 
   # Capture the FIRST 32 HEX CHARS of each share's y-bytes as the search
-  # "fingerprint". 32 chars is unique enough to detect a leak while small
-  # enough that it's still likely-unique in the dump output (the hashes of
-  # short strings collide with random hex too often).
+  # "fingerprint". Save them to a temp file rather than holding them in
+  # Bash variables — macOS Bash 3.2's `declare -p` output format differs
+  # from Linux Bash 5.x, so any name-based filter is unreliable. Saving
+  # to a file gets the search needle out of the variable space entirely.
   share1_fp="${fresh[0]##*:}"
   share1_fp="${share1_fp:0:32}"
   share2_fp="${fresh[1]##*:}"
   share2_fp="${share2_fp:0:32}"
+  printf '%s\n%s\n' "$share1_fp" "$share2_fp" > "$FP_FILE_SEAL"
 
   # ─── 2. submit shares — vault unseals ──────────────────────────────────
   seal_submit_share "${fresh[0]}"
@@ -315,12 +321,7 @@ HEAP_DUMP_RESULTS=$(
   local_init=""
 
   # ─── 4. snapshot all variables ─────────────────────────────────────────
-  all_vars=$(declare -p 2>/dev/null | grep -v '^declare -[fF]')
-
-  # The dump itself contains share1_fp and share2_fp (we still need them
-  # for searching). Strip those declarations before counting leaks.
-  filtered=$(echo "$all_vars" \
-    | grep -vE '^declare -- (share[12]_fp|all_vars|filtered|kek_count|hmac_count)=')
+  all_vars=$(declare -p 2>/dev/null)
 
   # ─── 5. assertion: _SHARES_COLLECTED is empty ─────────────────────────
   if [ "${#_SHARES_COLLECTED[@]}" -eq 0 ]; then
@@ -329,17 +330,30 @@ HEAP_DUMP_RESULTS=$(
     echo "FAIL: _SHARES_COLLECTED has ${#_SHARES_COLLECTED[@]} entries"
   fi
 
-  # ─── 6. assertion: share fingerprints absent from filtered dump ───────
-  if ! echo "$filtered" | grep -qF "$share1_fp"; then
+  # ─── 6. assertion: share fingerprints absent ──────────────────────────
+  # Filter by simple grep -v on variable names (works on Bash 3.2 + 5.x).
+  filtered=$(echo "$all_vars" \
+    | grep -v "share1_fp" \
+    | grep -v "share2_fp" \
+    | grep -v "all_vars"  \
+    | grep -v "filtered"  \
+    | grep -v "kek_count" \
+    | grep -v "hmac_count")
+
+  s1=$(sed -n '1p' "$FP_FILE_SEAL")
+  s2=$(sed -n '2p' "$FP_FILE_SEAL")
+
+  if ! echo "$filtered" | grep -qF "$s1"; then
     echo "PASS: share 1 hex absent from process memory"
   else
-    leak=$(echo "$filtered" | grep -nF "$share1_fp" | head -1 | cut -c1-100)
+    leak=$(echo "$filtered" | grep -nF "$s1" | head -1 | cut -c1-100)
     echo "FAIL: share 1 hex leaked at: $leak"
   fi
-  if ! echo "$filtered" | grep -qF "$share2_fp"; then
+  if ! echo "$filtered" | grep -qF "$s2"; then
     echo "PASS: share 2 hex absent from process memory"
   else
-    echo "FAIL: share 2 hex leaked"
+    leak=$(echo "$filtered" | grep -nF "$s2" | head -1 | cut -c1-100)
+    echo "FAIL: share 2 hex leaked at: $leak"
   fi
 
   # ─── 7. assertion: KEK appears in exactly one variable each ───────────
@@ -349,22 +363,29 @@ HEAP_DUMP_RESULTS=$(
   [ "$hmac_count" -eq 1 ] && echo "PASS: HMAC in exactly 1 variable" || echo "FAIL: HMAC in $hmac_count variables"
 
   # ─── 8. seal and re-snapshot — KEK pair must be gone ──────────────────
-  # Save the KEK fingerprints (first 32 chars) so we can search after seal.
-  kek_fp="${_STRONGBOX_KEK:0:32}"
-  hmac_fp="${_STRONGBOX_HMAC_KEK:0:32}"
+  # Save KEK fingerprints to the temp file before sealing.
+  printf '%s\n%s\n' "${_STRONGBOX_KEK:0:32}" "${_STRONGBOX_HMAC_KEK:0:32}" > "$KEK_FILE_SEAL"
 
   seal_seal
 
-  all_vars_after=$(declare -p 2>/dev/null | grep -v '^declare -[fF]')
+  all_vars_after=$(declare -p 2>/dev/null)
   filtered_after=$(echo "$all_vars_after" \
-    | grep -vE '^declare -- (kek_fp|hmac_fp|share[12]_fp|all_vars|all_vars_after|filtered|filtered_after|kek_count|hmac_count)=')
+    | grep -v "share1_fp" \
+    | grep -v "share2_fp" \
+    | grep -v "all_vars"  \
+    | grep -v "filtered"  \
+    | grep -v "kek_count" \
+    | grep -v "hmac_count")
 
-  if ! echo "$filtered_after" | grep -qF "$kek_fp"; then
+  k1=$(sed -n '1p' "$KEK_FILE_SEAL")
+  k2=$(sed -n '2p' "$KEK_FILE_SEAL")
+
+  if ! echo "$filtered_after" | grep -qF "$k1"; then
     echo "PASS: KEK absent after seal"
   else
     echo "FAIL: KEK still present after seal"
   fi
-  if ! echo "$filtered_after" | grep -qF "$hmac_fp"; then
+  if ! echo "$filtered_after" | grep -qF "$k2"; then
     echo "PASS: HMAC absent after seal"
   else
     echo "FAIL: HMAC still present after seal"

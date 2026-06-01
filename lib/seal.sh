@@ -208,14 +208,16 @@ seal_submit_share() {
 
   # Reject duplicate share submissions.
   local existing
-  for existing in "${_SHARES_COLLECTED[@]}"; do
-    if [ "${existing}" = "${share}" ]; then
-      local progress="${#_SHARES_COLLECTED[@]}"
-      _SEAL_RESPONSE="$(printf '{"error":"duplicate share","sealed":true,"progress":"%d/%d"}' \
-        "${progress}" "${_SHARES_REQUIRED}")"
-      return 1
-    fi
-  done
+  if [ "${#_SHARES_COLLECTED[@]}" -gt 0 ]; then
+    for existing in "${_SHARES_COLLECTED[@]}"; do
+      if [ "${existing}" = "${share}" ]; then
+        local progress="${#_SHARES_COLLECTED[@]}"
+        _SEAL_RESPONSE="$(printf '{"error":"duplicate share","sealed":true,"progress":"%d/%d"}' \
+          "${progress}" "${_SHARES_REQUIRED}")"
+        return 1
+      fi
+    done
+  fi
 
   _SHARES_COLLECTED+=("${share}")
   local progress="${#_SHARES_COLLECTED[@]}"
@@ -291,11 +293,13 @@ _seal_reconstruct_and_unseal() {
 _zero_collected_shares() {
   # Helper: overwrite every share with zeroes, then clear the array.
   local i
-  for i in "${!_SHARES_COLLECTED[@]}"; do
-    local len="${#_SHARES_COLLECTED[$i]}"
-    _SHARES_COLLECTED[$i]="$(head -c "${len}" /dev/zero | tr '\0' '0')"
-    unset '_SHARES_COLLECTED[$i]'
-  done
+  if [ "${#_SHARES_COLLECTED[@]}" -gt 0 ]; then
+    for i in "${!_SHARES_COLLECTED[@]}"; do
+      local len="${#_SHARES_COLLECTED[$i]}"
+      _SHARES_COLLECTED[$i]="$(head -c "${len}" /dev/zero | tr '\0' '0')"
+      unset '_SHARES_COLLECTED[$i]'
+    done
+  fi
   _SHARES_COLLECTED=()
 }
 
@@ -350,8 +354,11 @@ seal_clear_root_token() {
   # Called by auth.sh after the root token has been bound to a user.
   # The token itself remains valid — this just removes the bootstrap value
   # from seal.sh's memory.
-  local zero
-  zero="$(head -c "${#_ROOT_TOKEN}" /dev/zero | tr '\0' '0')"
-  _ROOT_TOKEN="${zero}"
+  local token_len="${#_ROOT_TOKEN}"
+  if [ "${token_len}" -gt 0 ]; then
+    local zero
+    zero="$(head -c "${token_len}" /dev/zero | tr '\0' '0')"
+    _ROOT_TOKEN="${zero}"
+  fi
   _ROOT_TOKEN=""
 }

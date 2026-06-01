@@ -83,8 +83,8 @@ crypto_clear_kek() {
   # internally), but this closes the most obvious window.
   local kek_len="${#_STRONGBOX_KEK}"
   local hmac_len="${#_STRONGBOX_HMAC_KEK}"
-  _STRONGBOX_KEK="$(head -c "${kek_len}" /dev/zero | tr '\0' '0')"
-  _STRONGBOX_HMAC_KEK="$(head -c "${hmac_len}" /dev/zero | tr '\0' '0')"
+  [ "${kek_len}"  -gt 0 ] && _STRONGBOX_KEK="$(head -c "${kek_len}" /dev/zero | tr '\0' '0')"
+  [ "${hmac_len}" -gt 0 ] && _STRONGBOX_HMAC_KEK="$(head -c "${hmac_len}" /dev/zero | tr '\0' '0')"
   _STRONGBOX_KEK=""
   _STRONGBOX_HMAC_KEK=""
 }
