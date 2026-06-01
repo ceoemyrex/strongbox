@@ -5,19 +5,19 @@ name: strongbox
 #   DOMAIN       — your public domain for TLS cert paths
 
 services:
-
   strongbox-node-1:
     build: .
     container_name: strongbox-node-1
     environment:
-      STRONGBOX_NODE_ID:      node-1
-      STRONGBOX_PORT:         "8200"
-      STRONGBOX_PEERS:        "http://strongbox-node-2:8200 http://strongbox-node-3:8200"
-      STRONGBOX_PG_DSN:       "postgresql://sbadmin:${PG_PASSWORD}@postgres:5432/strongbox"
-      LEASE_DEFAULT_TTL:      "3600"
-      LEASE_MAX_TTL:          "86400"
-      LEASE_REAPER_INTERVAL:  "10"
+      STRONGBOX_NODE_ID: node-1
+      STRONGBOX_PORT: "8200"
+      STRONGBOX_PEERS: "http://strongbox-node-2:8200 http://strongbox-node-3:8200"
+      STRONGBOX_PG_DSN: "postgresql://sbadmin:${PG_PASSWORD}@postgres:5432/strongbox"
+      LEASE_DEFAULT_TTL: "3600"
+      LEASE_MAX_TTL: "86400"
+      LEASE_REAPER_INTERVAL: "10"
       REVOCATION_MAX_BACKOFF: "3600"
+      STRONGBOX_AUDIT_HMAC_KEY: "${STRONGBOX_AUDIT_HMAC_KEY}"
     volumes:
       - ./config.yaml:/etc/strongbox/config.yaml:ro
       - node1-audit:/var/log/strongbox
@@ -34,14 +34,15 @@ services:
     build: .
     container_name: strongbox-node-2
     environment:
-      STRONGBOX_NODE_ID:      node-2
-      STRONGBOX_PORT:         "8200"
-      STRONGBOX_PEERS:        "http://strongbox-node-1:8200 http://strongbox-node-3:8200"
-      STRONGBOX_PG_DSN:       "postgresql://sbadmin:${PG_PASSWORD}@postgres:5432/strongbox"
-      LEASE_DEFAULT_TTL:      "3600"
-      LEASE_MAX_TTL:          "86400"
-      LEASE_REAPER_INTERVAL:  "10"
+      STRONGBOX_NODE_ID: node-2
+      STRONGBOX_PORT: "8200"
+      STRONGBOX_PEERS: "http://strongbox-node-1:8200 http://strongbox-node-3:8200"
+      STRONGBOX_PG_DSN: "postgresql://sbadmin:${PG_PASSWORD}@postgres:5432/strongbox"
+      LEASE_DEFAULT_TTL: "3600"
+      LEASE_MAX_TTL: "86400"
+      LEASE_REAPER_INTERVAL: "10"
       REVOCATION_MAX_BACKOFF: "3600"
+      STRONGBOX_AUDIT_HMAC_KEY: "${STRONGBOX_AUDIT_HMAC_KEY}"
     volumes:
       - ./config.yaml:/etc/strongbox/config.yaml:ro
       - node2-audit:/var/log/strongbox
@@ -58,14 +59,15 @@ services:
     build: .
     container_name: strongbox-node-3
     environment:
-      STRONGBOX_NODE_ID:      node-3
-      STRONGBOX_PORT:         "8200"
-      STRONGBOX_PEERS:        "http://strongbox-node-1:8200 http://strongbox-node-2:8200"
-      STRONGBOX_PG_DSN:       "postgresql://sbadmin:${PG_PASSWORD}@postgres:5432/strongbox"
-      LEASE_DEFAULT_TTL:      "3600"
-      LEASE_MAX_TTL:          "86400"
-      LEASE_REAPER_INTERVAL:  "10"
+      STRONGBOX_NODE_ID: node-3
+      STRONGBOX_PORT: "8200"
+      STRONGBOX_PEERS: "http://strongbox-node-1:8200 http://strongbox-node-2:8200"
+      STRONGBOX_PG_DSN: "postgresql://sbadmin:${PG_PASSWORD}@postgres:5432/strongbox"
+      LEASE_DEFAULT_TTL: "3600"
+      LEASE_MAX_TTL: "86400"
+      LEASE_REAPER_INTERVAL: "10"
       REVOCATION_MAX_BACKOFF: "3600"
+      STRONGBOX_AUDIT_HMAC_KEY: "${STRONGBOX_AUDIT_HMAC_KEY}"
     volumes:
       - ./config.yaml:/etc/strongbox/config.yaml:ro
       - node3-audit:/var/log/strongbox
@@ -82,9 +84,9 @@ services:
     image: postgres:16-alpine
     container_name: strongbox-postgres
     environment:
-      POSTGRES_USER:     sbadmin
+      POSTGRES_USER: sbadmin
       POSTGRES_PASSWORD: "${PG_PASSWORD}"
-      POSTGRES_DB:       strongbox
+      POSTGRES_DB: strongbox
     volumes:
       - pgdata:/var/lib/postgresql/data
     networks: [cluster]
