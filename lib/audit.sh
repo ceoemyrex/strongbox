@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # lib/audit.sh — tamper-evident HMAC-SHA256 chain
 #
-# Each entry hashes (index|ts|token_id|op|path|prev_hash) with a server key.
-# Uses flock for safe concurrent appends from ncat handlers.
+# Each log entry covers: index | ts | token_id | op | path | prev_hmac
+# Chain property: entry N's HMAC is stored as prev_hash in entry N+1.
+# Any modification breaks the chain — detected by audit_verify.
+# flock prevents race conditions when multiple ncat handlers append simultaneously.
 
 set -euo pipefail
 
@@ -13,6 +15,7 @@ audit_init() {
   _AUDIT_LOG_FILE="${1:-${STRONGBOX_AUDIT_LOG_FILE:-/var/log/strongbox/audit.log}}"
   mkdir -p "$(dirname "${_AUDIT_LOG_FILE}")"
   _AUDIT_HMAC_KEY="${STRONGBOX_AUDIT_HMAC_KEY:-}"
+  # Only generate a random key if none was provided via env (survives restarts via env export)
   [[ -z "${_AUDIT_HMAC_KEY}" ]] && _AUDIT_HMAC_KEY="$(openssl rand -hex 32)"
   return 0
 }
@@ -28,7 +31,7 @@ audit_append() {
   local index=0
 
   (
-    flock -x 200
+    flock -x 200  # exclusive lock on file descriptor 200
     if [[ -s "${_AUDIT_LOG_FILE}" ]]; then
       local last_line; last_line="$(tail -n 1 "${_AUDIT_LOG_FILE}")"
       index="$(echo "${last_line}" | grep -o '"index":[0-9]*' | cut -d: -f2)"
@@ -45,6 +48,7 @@ audit_append() {
   ) 200>"${_AUDIT_LOG_FILE}.lock"
 }
 
+# Replays the chain from entry 1, fails on any HMAC or prev_hash mismatch
 audit_verify() {
   local log_file="$1"
   _AUDIT_HMAC_KEY="${STRONGBOX_AUDIT_HMAC_KEY:-}"
@@ -65,6 +69,7 @@ audit_verify() {
     stored_hmac="$(echo "${line}" | grep -o '"hmac":"[^"]*"' | cut -d\" -f4)"
     [[ -z "${index}" ]] && index="${line_number}"
 
+    # Check linkage: prev_hash stored in this entry must match previous entry's hmac
     [[ "${stored_prev}" != "${prev_hash}" ]] && { echo "TAMPERED: audit entry index ${index}" >&2; return 1; }
 
     local payload expected
@@ -72,12 +77,13 @@ audit_verify() {
     expected="$(printf '%s' "${payload}" | openssl dgst -sha256 -hmac "${_AUDIT_HMAC_KEY}" | awk '{print $2}')"
     [[ "${stored_hmac}" != "${expected}" ]] && { echo "TAMPERED: audit entry index ${index}" >&2; return 1; }
 
-    prev_hash="${stored_hmac}"
+    prev_hash="${stored_hmac}"  # advance chain
   done < "${log_file}"
 
   echo "audit log intact (${line_number} entries verified)"
 }
 
+# Returns all entries as a JSON array, optionally filtered by token_id
 audit_query() {
   local filter_token="${1:-}"
   [[ -z "${_AUDIT_LOG_FILE}" || ! -f "${_AUDIT_LOG_FILE}" ]] && { echo '[]'; return; }

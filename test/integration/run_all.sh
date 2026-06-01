@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Runs all integration scenarios in order. Each script is an independent grading scenario.
+# STRONGBOX_ROOT_TOKEN is extracted from 00_init output and exported for subsequent tests.
+
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,6 +24,7 @@ run() {
 
 run "${DIR}/00_init.sh"
 
+# 00_init writes /tmp/sb_init.json; extract root_token so later scripts can authenticate
 if [[ -f /tmp/sb_init.json ]]; then
   export STRONGBOX_ROOT_TOKEN="$(python3 -c "import json; print(json.load(open('/tmp/sb_init.json'))['root_token'])")"
 fi

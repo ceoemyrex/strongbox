@@ -1,6 +1,6 @@
 server:
   port: 8200
-  node_id: "${STRONGBOX_NODE_ID}"
+  node_id: "${STRONGBOX_NODE_ID}"   # injected from compose env
 
 cluster:
   peers:
@@ -8,24 +8,24 @@ cluster:
     - "http://strongbox-node-3:8200"
 
 shamir:
-  threshold: 2
-  shares: 3
+  threshold: 2   # minimum shares needed to reconstruct the KEK
+  shares: 3      # total shares distributed to operators
 
 election:
-  timeout_min_ms: 150
-  timeout_max_ms: 300
-  heartbeat_interval_ms: 50
+  timeout_min_ms: 150        # follower starts election after this much silence
+  timeout_max_ms: 300        # randomised upper bound (avoids split votes)
+  heartbeat_interval_ms: 50  # leader ping interval; must be << timeout_min
 
 leases:
-  default_ttl: 3600
-  max_ttl: 86400
-  reaper_interval: 10
+  default_ttl: 3600    # 1 hour
+  max_ttl: 86400       # 24 hours — renewals cannot exceed now + max_ttl
+  reaper_interval: 10  # seconds between reaper ticks
 
 dynamic_postgres:
-  dsn: "${STRONGBOX_PG_DSN}"
+  dsn: "${STRONGBOX_PG_DSN}"   # injected from compose env
   default_lease_ttl: 3600
   max_lease_ttl: 86400
-  revocation_max_backoff: 3600
+  revocation_max_backoff: 3600  # cap on exponential backoff for pending revocations
 
 audit:
   log_file: "/var/log/strongbox/audit.log"

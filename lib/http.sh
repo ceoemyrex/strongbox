@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
-# lib/http.sh — HTTP routing + handlers
+# lib/http.sh — HTTP routing + request handlers
 #
-# Sourced by bin/http-handler (one ncat-forked process per connection).
-# Reads one request from stdin, writes HTTP response to stdout.
+# Sourced by bin/http-handler, which ncat forks once per TCP connection.
+# One request in on stdin → one HTTP response out on stdout.
+#
+# Request flow:
+#   1. Parse request line + headers
+#   2. Seal check — most paths blocked when sealed
+#   3. Leader check — write ops on non-leaders → 307 redirect or 503
+#   4. Auth check — validate Bearer token (except sys/auth endpoints)
+#   5. Route → handler function
 
 set -uo pipefail
 
@@ -17,6 +24,8 @@ done
 _NODE_ID="${STRONGBOX_NODE_ID:-node-1}"
 SEALED_FILE="${SEALED_FILE:-/data/sealed}"
 
+# ── Response helpers ──────────────────────────────────────────────────────────
+
 http_json() {
   local code="$1" body="$2" reason
   case "${code}" in
@@ -29,12 +38,10 @@ http_json() {
     "${code}" "${reason}" "${#body}" "${body}"
 }
 
-http_error() { http_json "$1" "$(printf '{"error":"%s"}' "$2")"; }
+http_error()      { http_json "$1" "$(printf '{"error":"%s"}' "$2")"; }
+http_no_content() { printf 'HTTP/1.1 204 No Content\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'; }
 
-http_no_content() {
-  printf 'HTTP/1.1 204 No Content\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'
-}
-
+# Extracts a key from a JSON string using Python (handles nested types)
 _json_get() {
   python3 -c "import json,sys
 d=json.load(sys.stdin)
@@ -43,6 +50,8 @@ if v is None: print('')
 elif isinstance(v,(dict,list)): print(json.dumps(v))
 else: print(v)" <<< "$1" 2>/dev/null
 }
+
+# ── Request parsing ───────────────────────────────────────────────────────────
 
 http_handle_connection() {
   local request_line="" content_length=0 auth_header="" body="" line=""
@@ -56,6 +65,7 @@ http_handle_connection() {
   local rest="${request_line#* }"
   path="${rest%% *}"
 
+  # Read headers until blank line (end of header block)
   while IFS= read -r line; do
     line="${line//$'\r'/}"
     [[ -z "${line}" ]] && break
@@ -65,6 +75,7 @@ http_handle_connection() {
     esac
   done
 
+  # Read body exactly content_length bytes (avoids hanging on keep-alive)
   if [[ "${content_length}" =~ ^[0-9]+$ && "${content_length}" -gt 0 ]]; then
     IFS= read -r -N "${content_length}" body || true
   fi
@@ -72,17 +83,20 @@ http_handle_connection() {
   local token=""
   [[ "${auth_header}" == Bearer\ * ]] && token="${auth_header#Bearer }"
 
-  seal_init
+  seal_init  # loads _SHARES_REQUIRED/_SHARES_TOTAL from config.yaml
   _http_route "${method}" "${path}" "${body}" "${token}"
 }
+
+# ── Router ────────────────────────────────────────────────────────────────────
 
 _http_route() {
   local method="$1" raw_path="$2" body="$3" token="$4"
   local path="${raw_path%%\?*}"
   [[ "${path}" != "/" ]] && path="${path%/}"
   local qs=""; [[ "${raw_path}" == *\?* ]] && qs="${raw_path#*\?}"
-  local rp="${path#/v1/}"
+  local rp="${path#/v1/}"  # path without /v1/ prefix, used for storage keys
 
+  # Sealed vault: only health/unseal/init and internal paths pass through
   if seal_is_sealed; then
     case "${method} ${path}" in
       *"/v1/sys/health"|*"/v1/sys/unseal"|*"/v1/sys/init"|*"/internal/"*) ;;
@@ -90,6 +104,8 @@ _http_route() {
     esac
   fi
 
+  # Leader gate: writes on a non-leader node → 307 (redirect) or 503 (no quorum)
+  # Exempted: seal/unseal endpoints and internal consensus paths
   case "${method}" in
     PUT|POST|DELETE)
       case "${path}" in
@@ -104,6 +120,7 @@ _http_route() {
       esac ;;
   esac
 
+  # Auth gate: validate Bearer token for all paths except public endpoints
   case "${path}" in
     /v1/sys/*|/internal/*|/v1/auth/login) ;;
     *) if [[ -z "${token}" ]] || ! auth_validate "${token}"; then
@@ -111,6 +128,7 @@ _http_route() {
        fi ;;
   esac
 
+  # Route to handler
   case "${method} ${path}" in
     "POST /v1/sys/init")    _h_init "${body}" ;;
     "POST /v1/sys/unseal")  _h_unseal "${body}" ;;
@@ -137,6 +155,7 @@ _http_route() {
 
     "GET /v1/audit") _h_audit "${qs}" "${token}" ;;
 
+    # Internal consensus endpoints — no auth required, intra-cluster only
     "POST /internal/vote")
       consensus_handle_vote "${body}"; http_json 200 "${_CONSENSUS_RESPONSE}" ;;
     "POST /internal/heartbeat")
@@ -145,6 +164,8 @@ _http_route() {
     *) http_error 404 "not found" ;;
   esac
 }
+
+# ── Handlers ──────────────────────────────────────────────────────────────────
 
 _h_init() {
   seal_is_initialized && { http_error 409 "already initialized"; return; }
@@ -156,7 +177,7 @@ _h_unseal() {
   local share; share="$(_json_get "$1" share)"
   [[ -z "${share}" ]] && { http_error 400 "missing share in request body"; return; }
   seal_submit_share "${share}" || true
-  share=""
+  share=""  # zero local copy
   case "${_SEAL_RESPONSE}" in
     *'"error"'*'not initialized'*|*'"error"'*'already unsealed'*|*'"error"'*'duplicate'*) http_json 409 "${_SEAL_RESPONSE}" ;;
     *'"error"'*) http_json 400 "${_SEAL_RESPONSE}" ;;

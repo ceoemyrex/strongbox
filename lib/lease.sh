@@ -2,7 +2,12 @@
 # lib/lease.sh — lease lifecycle + background reaper
 #
 # States: active → expired → revoked | revocation_pending
-# File layout: ${dir}/${id}.meta (JSON), ${id}.state, ${id}.retry
+#
+# File layout per lease ID under STRONGBOX_LEASE_DIR:
+#   {id}.meta   — JSON: lease_id, path, ttl, expires_at
+#   {id}.state  — current state string
+#   {id}.retry  — "{next_retry_unix} {attempt_count}" for revocation_pending
+#   {id}.dyn    — "username:role" for dynamic-postgres leases
 
 set -euo pipefail
 
@@ -32,6 +37,7 @@ lease_get() {
   local meta state
   meta="$(cat "${_LEASE_STATE_DIR}/${lease_id}.meta")"
   state="$(cat "${_LEASE_STATE_DIR}/${lease_id}.state" 2>/dev/null || echo unknown)"
+  # Inject state into the meta JSON by stripping the closing brace and appending
   echo "${meta%\}},\"state\":\"${state}\"}"
 }
 
@@ -44,6 +50,7 @@ lease_renew() {
   local meta; meta="$(cat "${_LEASE_STATE_DIR}/${lease_id}.meta")"
   local cur_exp; cur_exp="$(echo "${meta}" | grep -o '"expires_at":[0-9]*' | cut -d: -f2)"
   local new_exp=$(( cur_exp + _LEASE_DEFAULT_TTL ))
+  # Hard cap: cannot renew past now + MAX_TTL
   local max_exp=$(( $(date +%s) + _LEASE_MAX_TTL ))
   (( new_exp > max_exp )) && new_exp="${max_exp}"
 
@@ -55,6 +62,7 @@ lease_renew() {
 lease_revoke() {
   local lease_id="$1"
   [[ -f "${_LEASE_STATE_DIR}/${lease_id}.state" ]] || { echo '{"error":"lease not found"}'; return 1; }
+  # Try immediate revocation; if DB unreachable, mark pending for reaper to retry
   if dynamic_revoke_lease "${lease_id}" 2>/dev/null; then
     printf 'revoked' > "${_LEASE_STATE_DIR}/${lease_id}.state"
     rm -f "${_LEASE_STATE_DIR}/${lease_id}.retry"
@@ -64,6 +72,7 @@ lease_revoke() {
   fi
 }
 
+# Launches the reaper as a background subshell; disowned so it outlives any handler
 lease_reaper_start() {
   export _LEASE_STATE_DIR STRONGBOX_PG_DSN
   ( while true; do sleep "${_LEASE_REAPER_INTERVAL}"; _lease_reaper_tick; done ) &
@@ -86,6 +95,7 @@ _lease_reaper_tick() {
           if dynamic_revoke_lease "${id}" 2>/dev/null; then
             printf 'revoked' > "${sf}"; rm -f "${_LEASE_STATE_DIR}/${id}.dyn"
           else
+            # DB unreachable — schedule retry with exponential backoff
             printf 'revocation_pending' > "${sf}"
             printf '%d 1' "$(( now + 10 ))" > "${_LEASE_STATE_DIR}/${id}.retry"
           fi
@@ -98,6 +108,7 @@ _lease_reaper_tick() {
           if dynamic_revoke_lease "${id}" 2>/dev/null; then
             printf 'revoked' > "${sf}"; rm -f "${_LEASE_STATE_DIR}/${id}.retry" "${_LEASE_STATE_DIR}/${id}.dyn"
           else
+            # Backoff: 10s, 20s, 40s … capped at REVOCATION_MAX_BACKOFF
             cnt=$(( cnt + 1 )); local bo=$(( 10 * (2 ** (cnt - 1)) ))
             (( bo > _REVOCATION_MAX_BACKOFF )) && bo="${_REVOCATION_MAX_BACKOFF}"
             printf '%d %d' "$(( now + bo ))" "${cnt}" > "${_LEASE_STATE_DIR}/${id}.retry"

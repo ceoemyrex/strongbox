@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # lib/auth.sh — tokens, passwords (Argon2id), policies
 #
-# All state via storage_kv_put/get (file-backed, shared across ncat handlers).
-# Revocation is synchronous — revoked token fails on next request.
+# All state via storage_kv_put/get (file-backed on tmpfs, shared across ncat handlers).
+# Revocation is synchronous — writing "false" takes effect on the next request.
 
 set -euo pipefail
 
-AUTH_TOKEN_ID=""
-AUTH_TOKEN_POLICIES=""
+AUTH_TOKEN_ID=""       # populated by auth_validate, used by handlers for audit
+AUTH_TOKEN_POLICIES="" # populated by auth_validate
 
 auth_init() { storage_init; }
 
+# Called once at init — stamps root token directly into storage with root policy
 auth_bootstrap_root() {
   local token="$1"
   storage_kv_put "token:${token}:valid" "true"
@@ -19,6 +20,8 @@ auth_bootstrap_root() {
   storage_kv_put "token:${token}:id" "root"
 }
 
+# Hashes with argon2 CLI (-m 16 = 2^16 = 64 MB memory cost)
+# Verify uses Python argon2-cffi because the CLI has no verify-only mode
 auth_user_create() {
   local username="$1" password="$2" policies="${3:-[]}"
   local salt hash
@@ -35,6 +38,7 @@ auth_login() {
     echo '{"error":"invalid credentials"}'; return 1
   }
 
+  # argon2-cffi extracts the embedded salt from the stored hash for re-derivation
   local valid
   valid="$(python3 - "${password}" "${stored_hash}" <<'PY'
 import sys
@@ -48,6 +52,7 @@ PY
 )"
   [[ "${valid}" != "ok" ]] && { echo '{"error":"invalid credentials"}'; return 1; }
 
+  # Token is 32-byte opaque random hex — not a JWT
   local token token_id policies
   token="$(openssl rand -hex 32)"
   token_id="$(openssl rand -hex 8)"
@@ -61,6 +66,7 @@ PY
   printf '{"token":"%s","policies":%s}' "${token}" "${policies}"
 }
 
+# Validates token and populates AUTH_TOKEN_ID / AUTH_TOKEN_POLICIES for the caller
 auth_validate() {
   local token="$1"
   local valid
@@ -70,6 +76,7 @@ auth_validate() {
   AUTH_TOKEN_POLICIES="$(storage_kv_get "token:${token}:policies" 2>/dev/null || echo '[]')"
 }
 
+# Synchronous revocation — next auth_validate call fails immediately
 auth_revoke() {
   local token="$1"
   storage_kv_put "token:${token}:valid" "false"
@@ -87,6 +94,8 @@ auth_policy_get() {
   storage_kv_get "policy:$1" 2>/dev/null || { echo '{"error":"policy not found"}'; return 1; }
 }
 
+# Checks if token's policies allow op (read/write/delete) on req_path
+# root policy bypasses all checks; other policies checked with wildcard matching
 auth_policy_check() {
   local token="$1" op="$2" req_path="$3"
   auth_validate "${token}" || return 1
@@ -112,6 +121,7 @@ auth_policy_check() {
   return 1
 }
 
+# Supports trailing wildcard: "secret/app/*" matches "secret/app/db"
 _auth_path_matches() {
   local pattern="$1" req_path="$2"
   if [[ "${pattern}" == *"*" ]]; then
