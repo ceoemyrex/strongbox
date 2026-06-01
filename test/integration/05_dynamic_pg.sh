@@ -2,7 +2,7 @@
 # test/integration/05_dynamic_pg.sh — grading scenario: Read dynamic-postgres/readonly verify pg_roles
 set -euo pipefail
 
-BASE_URL="${STRONGBOX_URL:-http://localhost:8200}"
+BASE_URL="${STRONGBOX_URL:-http://localhost:8201}"
 ROOT_TOKEN="${STRONGBOX_ROOT_TOKEN:-}"
 PG_CONTAINER="${STRONGBOX_PG_CONTAINER:-strongbox-postgres}"
 PASS=0; FAIL=0

@@ -104,6 +104,9 @@ _http_route() {
     esac
   fi
 
+  # Initialise storage for internal replicate calls on sealed nodes
+  case "${path}" in /internal/replicate) storage_init ;; esac
+
   # Leader gate: writes on a non-leader → 307 redirect or 503 (no quorum).
   # Leader also checks quorum: a partitioned leader refuses writes rather than
   # accepting them in a minority partition (Raft safety rule).
@@ -166,6 +169,10 @@ _http_route() {
     "POST /internal/heartbeat")
       consensus_handle_hb "${body}"; http_json 200 "${_CONSENSUS_RESPONSE}" ;;
 
+    # Internal replication — leader pushes writes to followers
+    "POST /internal/replicate")
+      _h_internal_replicate "${body}"; http_json 200 '{"ok":true}' ;;
+
     *) http_error 404 "not found" ;;
   esac
 }
@@ -175,7 +182,18 @@ _http_route() {
 _h_init() {
   seal_is_initialized && { http_error 409 "already initialized"; return; }
   seal_init_cluster || true
-  case "${_SEAL_RESPONSE}" in *'"error"'*) http_json 400 "${_SEAL_RESPONSE}";; *) http_json 200 "${_SEAL_RESPONSE}";; esac
+  if [[ "${_SEAL_RESPONSE}" != *'"error"'* ]]; then
+    local rt; rt="$(_json_get "${_SEAL_RESPONSE}" root_token)"
+    if [[ -n "${rt}" ]]; then
+      _replicate_kv "token:${rt}:valid" "true"
+      _replicate_kv "token:${rt}:policies" '["root"]'
+      _replicate_kv "token:${rt}:created_at" "$(date +%s)"
+      _replicate_kv "token:${rt}:id" "root"
+    fi
+    http_json 200 "${_SEAL_RESPONSE}"
+  else
+    http_json 400 "${_SEAL_RESPONSE}"
+  fi
 }
 
 _h_unseal() {
@@ -207,6 +225,7 @@ _h_secret_put() {
   [[ -z "${data}" ]] && { http_error 400 "missing data"; return; }
   local env; env="$(crypto_encrypt "${data}")" || { http_error 500 "encryption failed"; return; }
   local ver; ver="$(storage_put "$1" "${env}")"
+  _replicate_secret "$1" "${env}"
   audit_append "${AUTH_TOKEN_ID:-anon}" "write" "secret/$1" 2>/dev/null || true
   http_json 201 "$(printf '{"version":%d}' "${ver}")"
 }
@@ -245,6 +264,15 @@ _h_login() {
   local u p; u="$(_json_get "$1" username)"; p="$(_json_get "$1" password)"
   [[ -z "${u}" || -z "${p}" ]] && { http_error 400 "missing username or password"; return; }
   local r; r="$(auth_login "${u}" "${p}")" || { http_error 401 "invalid credentials"; return; }
+  local new_token; new_token="$(_json_get "${r}" token)"
+  if [[ -n "${new_token}" ]]; then
+    _replicate_kv "token:${new_token}:valid" "true"
+    local npol; npol="$(_json_get "${r}" policies)"
+    _replicate_kv "token:${new_token}:policies" "${npol}"
+    _replicate_kv "token:${new_token}:created_at" "$(date +%s)"
+    local nid; nid="$(storage_kv_get "token:${new_token}:id" 2>/dev/null || true)"
+    _replicate_kv "token:${new_token}:id" "${nid}"
+  fi
   audit_append "anon" "login" "auth/login/${u}" 2>/dev/null || true
   http_json 200 "${r}"
 }
@@ -254,6 +282,7 @@ _h_revoke() {
   local t; t="$(_json_get "$1" token)"
   [[ -z "${t}" ]] && { http_error 400 "missing token field"; return; }
   auth_revoke "${t}"
+  _replicate_kv "token:${t}:valid" "false"
   audit_append "${AUTH_TOKEN_ID:-anon}" "revoke" "auth/revoke" 2>/dev/null || true
   http_no_content
 }
@@ -270,6 +299,9 @@ _h_user_put() {
   [[ -z "${pw}" ]] && { http_error 400 "missing password"; return; }
   [[ -z "${pol}" ]] && pol='[]'
   auth_user_create "${username}" "${pw}" "${pol}"
+  local stored_hash; stored_hash="$(storage_kv_get "user:${username}:hash" 2>/dev/null || true)"
+  _replicate_kv "user:${username}:hash" "${stored_hash}"
+  _replicate_kv "user:${username}:policies" "${pol}"
   http_json 201 '{"status":"created"}'
 }
 
@@ -277,6 +309,7 @@ _h_pol_put() {
   local rules; rules="$(_json_get "$2" rules)"
   [[ -z "${rules}" ]] && { http_error 400 "missing rules"; return; }
   auth_policy_put "$1" "${rules}"
+  _replicate_kv "policy:$1" "${rules}"
   http_json 201 '{"status":"created"}'
 }
 
@@ -300,4 +333,57 @@ _h_lease_revoke() {
 _h_audit() {
   local ft=""; [[ "$1" == *token=* ]] && ft="$(echo "$1" | grep -o 'token=[^&]*' | cut -d= -f2)"
   http_json 200 "$(audit_query "${ft}")"
+}
+
+# ── Replication ────────────────────────────────────────────────────────────────
+
+# Receives replicated KV/secret writes from the leader
+_h_internal_replicate() {
+  local body="$1"
+  local rtype; rtype="$(_json_get "${body}" type)"
+  local key; key="$(_json_get "${body}" key)"
+  local value; value="$(_json_get "${body}" value)"
+
+  case "${rtype}" in
+    kv)
+      storage_kv_put "${key}" "${value}" ;;
+    secret)
+      local safe; safe="$(_safe_path "${key}")"
+      mkdir -p "${STORAGE_DIR}"
+      local version=1
+      if [[ -f "${STORAGE_DIR}/${safe}.meta" ]]; then
+        version="$(cat "${STORAGE_DIR}/${safe}.meta")"
+        version=$(( version + 1 ))
+      fi
+      printf '%s' "${value}" > "${STORAGE_DIR}/${safe}.v${version}"
+      printf '%s' "${value}" > "${STORAGE_DIR}/${safe}"
+      printf '%s' "${version}" > "${STORAGE_DIR}/${safe}.meta"
+      ;;
+  esac
+}
+
+# Fire-and-forget: pushes a KV write to all peers
+_replicate_kv() {
+  local key="$1" value="$2"
+  IFS=' ' read -ra peers <<< "${STRONGBOX_PEERS:-}"
+  for peer in "${peers[@]}"; do
+    [[ -z "${peer}" ]] && continue
+    curl -sf --max-time 1 -X POST "${peer}/internal/replicate" \
+      -H 'Content-Type: application/json' \
+      -d "$(printf '{"type":"kv","key":"%s","value":"%s"}' "${key}" "${value}")" \
+      >/dev/null 2>&1 &
+  done
+}
+
+# Fire-and-forget: pushes a secret (encrypted envelope) to all peers
+_replicate_secret() {
+  local path="$1" envelope="$2"
+  IFS=' ' read -ra peers <<< "${STRONGBOX_PEERS:-}"
+  for peer in "${peers[@]}"; do
+    [[ -z "${peer}" ]] && continue
+    curl -sf --max-time 2 -X POST "${peer}/internal/replicate" \
+      -H 'Content-Type: application/json' \
+      -d "$(python3 -c "import json,sys; print(json.dumps({'type':'secret','key':sys.argv[1],'value':sys.argv[2]}))" "${path}" "${envelope}")" \
+      >/dev/null 2>&1 &
+  done
 }

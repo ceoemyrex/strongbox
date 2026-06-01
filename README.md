@@ -5,11 +5,11 @@ Encryption, auth, leasing, leader election, and tamper-evident audit — all in 
 
 ## Architecture
 
-![Architecture](./docs/Strongbox.png)
+![Architecture](./docs/architecture.png)
 
 ## Public cluster URL
 
-> TODO: add your VPS domain/IP after provisioning (replace with real domain before grading)
+**https://strong-box.duckdns.org**
 
 ## Quick start (fresh VPS)
 
@@ -19,24 +19,33 @@ git clone https://github.com/ceoemyrex/strongbox && cd strongbox
 
 # 2. Set secrets
 echo "PG_PASSWORD=$(openssl rand -hex 16)" > .env
+echo "STRONGBOX_AUDIT_HMAC_KEY=$(openssl rand -hex 32)" >> .env
 
 # 3. Get TLS cert (replace with your domain)
-certbot certonly --standalone -d yourdomain.com
+sudo certbot certonly --standalone -d strong-box.duckdns.org
 
 # 4. Start the cluster
-docker compose up -d
+docker compose up -d --build
 
 # 5. Init (one-time — save the output)
-curl -s -X POST https://yourdomain.com/v1/sys/init | tee init.json
+curl -s -X POST http://localhost:8201/v1/sys/init | tee init.json
 
-# 6. Unseal (submit K shares)
+# 6. Unseal ALL 3 nodes (each node needs K shares individually)
 SHARE1=$(jq -r '.shares[0]' init.json)
 SHARE2=$(jq -r '.shares[1]' init.json)
-curl -s -X POST https://yourdomain.com/v1/sys/unseal -d "{\"share\":\"$SHARE1\"}"
-curl -s -X POST https://yourdomain.com/v1/sys/unseal -d "{\"share\":\"$SHARE2\"}"
+for PORT in 8201 8202 8203; do
+  curl -s -X POST http://localhost:$PORT/v1/sys/unseal \
+    -H "Content-Type: application/json" -d "{\"share\":\"$SHARE1\"}"
+  curl -s -X POST http://localhost:$PORT/v1/sys/unseal \
+    -H "Content-Type: application/json" -d "{\"share\":\"$SHARE2\"}"
+done
 
-# 7. Verify unsealed
-curl -s https://yourdomain.com/v1/sys/health
+# 7. Verify all nodes unsealed
+for PORT in 8201 8202 8203; do
+  echo -n "node :$PORT → "
+  curl -s http://localhost:$PORT/v1/sys/health
+  echo ""
+done
 ```
 
 ## Threat model
@@ -261,17 +270,17 @@ StrongBox implements a simplified Raft-style leader election in `lib/consensus.s
 
 **Term numbers.** Every node maintains a monotonically increasing term counter. A term is a logical clock: two nodes can only be in the same election if they share the same term. When a node starts an election it increments its term. If it receives a message from a higher term it immediately updates its own and reverts to follower.
 
-**Starting an election.** Every node runs a background election timer with a randomised timeout between 150 ms and 300 ms. If a follower has not received a heartbeat from the leader before its timer fires, it declares itself a candidate, increments its term, votes for itself, and sends `POST /internal/vote` to every peer with its term and node ID.
+**Starting an election.** Every node runs a background election timer with a randomised timeout between 1000 ms and 2000 ms. If a follower has not received a heartbeat from the leader before its timer fires, it declares itself a candidate, increments its term, votes for itself, and sends `POST /internal/vote` to every peer with its term and node ID. Sealed nodes never start elections — only unsealed nodes can become leader.
 
 **Vote granting.** A node grants at most one vote per term. It grants a vote to candidate `C` in term `T` if and only if: (a) `T` is strictly greater than the node's current term, and (b) the node has not yet voted in term `T`. Granting a vote resets the receiver's heartbeat timer so it does not start a competing election while the candidate is still collecting votes.
 
 **Winning the election.** A candidate that collects votes from a strict majority (⌊N/2⌋ + 1 out of N nodes) becomes leader and immediately sends heartbeats to all peers. With N=3, 2 votes win. Because each node votes for at most one candidate per term, two candidates cannot both win the same term — at most one leader exists per term.
 
-**Heartbeats.** The leader sends `POST /internal/heartbeat` to all followers every 50 ms. A heartbeat carries the leader's current term and node ID. Receiving a heartbeat from a node whose term is ≥ the receiver's current term resets the follower's election timer, updates its recorded leader, and reverts any in-progress election.
+**Heartbeats.** The leader sends `POST /internal/heartbeat` to all followers every 200 ms. A heartbeat carries the leader's current term and node ID. Receiving a heartbeat from a node whose term is ≥ the receiver's current term resets the follower's election timer, updates its recorded leader, and reverts any in-progress election.
 
 **Partition behaviour (minority refuses writes).** Before accepting a write, a non-leader node checks whether it can reach a strict majority of peers via HTTP health checks (`consensus_quorum_reachable`). If a 2-node majority is partitioned away from a single follower, the follower counts only itself — below the quorum threshold of 2 — and refuses all write requests with HTTP 503. The majority partition elects a new leader among its reachable members within one election timeout and continues serving writes. When the partition heals, the minority node receives a heartbeat from the new leader, updates its term, reverts to follower, and rejoins without any manual intervention.
 
-**State persistence.** Because the election loop runs as a background subshell (forked from the main HTTP server), state changes (role, term, current leader) are written to shared temp files (`/tmp/sb_role.*`, `/tmp/sb_leader.*`, `/tmp/sb_term.*`) so the main shell's request handlers always read the current consensus state via `consensus_is_leader`, `consensus_leader_hint`, and `_consensus_read_term`.
+**State persistence.** Because the election loop runs as a background subshell (forked from the main HTTP server), state changes (role, term, current leader) are written to shared files under `/dev/shm/strongbox/consensus/` so ncat-forked request handlers always read the current consensus state via `consensus_is_leader`, `consensus_leader_hint`, and `_consensus_read_term`.
 
 ## Dynamic Postgres revocation when the DB is unreachable
 
@@ -359,15 +368,20 @@ curl -s -H "Authorization: Bearer $ROOT_TOKEN" "$BASE/v1/secrets/app/db?version=
 curl -s -X PUT $BASE/v1/policies/app-reader \
   -H "Authorization: Bearer $ROOT_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"rules":[{"path":"app/*","capabilities":["read"]}]}'
+  -d '{"rules":[{"path":"secret/app/*","capabilities":["read"]}]}'
 
 # Create a user with that policy
-curl -s -X POST $BASE/v1/auth/login \
+curl -s -X PUT $BASE/v1/users/alice \
+  -H "Authorization: Bearer $ROOT_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"username":"alice","password":"hunter2"}'
-# (first create alice via root — see admin workflow below)
+  -d '{"password":"hunter2","policies":["app-reader"]}'
 
-# With a scoped token:
+# Login as alice to get a scoped token
+LOGIN=$(curl -s -X POST $BASE/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"alice","password":"hunter2"}')
+SCOPED_TOKEN=$(echo $LOGIN | python3 -c "import json,sys; print(json.load(sys.stdin)['token'])")
+
 # READ secret/app/db → 200 OK
 curl -s -H "Authorization: Bearer $SCOPED_TOKEN" $BASE/v1/secrets/app/db
 
@@ -421,15 +435,15 @@ docker exec strongbox-postgres psql \
 ### Scenario 7 — Postgres down, lease expires, auto-cleanup
 
 ```bash
-# Mint a credential (TTL = DYNAMIC_LEASE_TTL, default 60s in compose.yaml)
+# Mint a credential (TTL = DYNAMIC_LEASE_TTL, configured 15s in compose.yaml)
 CRED=$(curl -s -H "Authorization: Bearer $ROOT_TOKEN" $BASE/v1/dynamic-postgres/readonly)
 USERNAME=$(echo $CRED | python3 -c "import json,sys; print(json.load(sys.stdin)['username'])")
 
 # Stop Postgres (triggers revocation_pending on next reaper tick)
 docker stop strongbox-postgres
 
-# Wait past the lease TTL
-sleep 70
+# Wait past the lease TTL (15s + buffer)
+sleep 20
 
 # Restart Postgres (reaper retries with exponential backoff)
 docker start strongbox-postgres
@@ -458,8 +472,8 @@ curl -s -X PUT $BASE/v1/secrets/app/db \
   -H "Content-Type: application/json" \
   -d '{"data":{"kill":"test"}}'
 
-# New leader elected within 300ms
-sleep 1
+# New leader elected within ~2s (election timeout 1000-2000ms)
+sleep 3
 curl -s $BASE/v1/sys/health
 # {"sealed":false,"leader":"node-2",...}
 

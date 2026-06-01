@@ -2,10 +2,10 @@
 # test/integration/06_pg_down.sh — grading scenario: Stop Postgres wait past TTL restart verify cleanup
 set -euo pipefail
 
-BASE_URL="${STRONGBOX_URL:-http://localhost:8200}"
+BASE_URL="${STRONGBOX_URL:-http://localhost:8201}"
 ROOT_TOKEN="${STRONGBOX_ROOT_TOKEN:-}"
 PG_CONTAINER="${STRONGBOX_PG_CONTAINER:-strongbox-postgres}"
-LEASE_TTL="${DYNAMIC_LEASE_TTL:-60}"
+LEASE_TTL="${DYNAMIC_LEASE_TTL:-15}"
 REAPER_INTERVAL="${LEASE_REAPER_INTERVAL:-5}"
 PASS=0; FAIL=0
 
