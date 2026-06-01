@@ -170,20 +170,70 @@ _handle_sys_health() {
 }
 
 _handle_secret_put() {
-  # TODO: validate token + policy (write), envelope-encrypt body.data,
-  # call storage_put, audit_append, return 201 {version}.
-  http_json 501 '{"error":"not implemented"}'
+  local route_path="${1}" body="${2}" token="${3}"
+  local secret_path="${route_path#/v1/secrets/}"
+  auth_validate "${token}" || { http_error 401 "unauthorized"; return; }
+  auth_policy_check "${token}" write "${secret_path}" || {
+    http_error 403 "forbidden"; return; }
+
+  local data envelope out_file version
+  data="$(_json_get_value "${body}" "data")"
+  [[ -z "${data}" ]] && { http_error 400 "missing data"; return; }
+  envelope="$(crypto_encrypt "${data}")" || { http_error 500 "encryption failed"; return; }
+
+  out_file="$(mktemp)"
+  storage_put "${secret_path}" "${envelope}" >"${out_file}" || {
+    rm -f "${out_file}"; http_error 500 "storage write failed"; return; }
+  version="$(cat "${out_file}")"
+  rm -f "${out_file}"
+
+  audit_append "${AUTH_TOKEN_ID}" "write" "${secret_path}"
+  http_json 201 "$(printf '{"version":%d}' "${version}")"
 }
 
 _handle_secret_get() {
-  # TODO: validate token + policy (read), storage_get, crypto_decrypt,
-  # lease_create, audit_append, return 200 {data, version, lease}.
-  http_json 501 '{"error":"not implemented"}'
+  local route_path="${1}" query_string="${2}" token="${3}"
+  local secret_path="${route_path#/v1/secrets/}"
+  auth_validate "${token}" || { http_error 401 "unauthorized"; return; }
+  auth_policy_check "${token}" read "${secret_path}" || {
+    http_error 403 "forbidden"; return; }
+
+  local requested_version version envelope data out_file lease_id
+  requested_version="$(_query_get "${query_string}" "version")"
+  if [[ -n "${requested_version}" && ! "${requested_version}" =~ ^[0-9]+$ ]]; then
+    http_error 400 "invalid version"; return
+  fi
+
+  envelope="$(storage_get "${secret_path}" "${requested_version}")" || {
+    http_error 404 "secret not found"; return; }
+  if [[ -n "${requested_version}" ]]; then
+    version="${requested_version}"
+  else
+    version="$(storage_latest_version "${secret_path}")" || {
+      http_error 404 "secret not found"; return; }
+  fi
+
+  data="$(crypto_decrypt "${envelope}")" || { http_error 500 "decryption failed"; return; }
+  out_file="$(mktemp)"
+  lease_create "${secret_path}" "${_LEASE_DEFAULT_TTL:-3600}" >"${out_file}" || {
+    rm -f "${out_file}"; http_error 500 "lease creation failed"; return; }
+  lease_id="$(cat "${out_file}")"
+  rm -f "${out_file}"
+
+  audit_append "${AUTH_TOKEN_ID}" "read" "${secret_path}"
+  http_json 200 "$(printf '{"data":%s,"version":%d,"lease":"%s"}' \
+    "$(_json_quote "${data}")" "${version}" "${lease_id}")"
 }
 
 _handle_secret_delete() {
-  # TODO: validate token + policy (delete), storage_delete, audit_append, 204.
-  http_json 501 '{"error":"not implemented"}'
+  local route_path="${1}" token="${2}"
+  local secret_path="${route_path#/v1/secrets/}"
+  auth_validate "${token}" || { http_error 401 "unauthorized"; return; }
+  auth_policy_check "${token}" delete "${secret_path}" || {
+    http_error 403 "forbidden"; return; }
+  storage_delete "${secret_path}" || { http_error 404 "secret not found"; return; }
+  audit_append "${AUTH_TOKEN_ID}" "delete" "${secret_path}"
+  http_json 204 ''
 }
 
 _handle_dynamic_pg() {
@@ -192,28 +242,68 @@ _handle_dynamic_pg() {
 }
 
 _handle_auth_login() {
-  # TODO: parse username/password from body, call auth_login, audit_append.
-  http_json 501 '{"error":"not implemented"}'
+  local body="${1}"
+  local username password out_file response token token_id
+  username="$(_json_get_string "${body}" "username")"
+  password="$(_json_get_string "${body}" "password")"
+  [[ -z "${username}" || -z "${password}" ]] && {
+    http_error 400 "missing credentials"; return; }
+
+  out_file="$(mktemp)"
+  if ! auth_login "${username}" "${password}" >"${out_file}"; then
+    rm -f "${out_file}"
+    http_error 401 "invalid credentials"
+    return
+  fi
+  response="$(cat "${out_file}")"
+  rm -f "${out_file}"
+
+  token="$(_json_get_string "${response}" "token")"
+  token_id="${_AUTH_TOKEN_INDEX[${token}]:-unknown}"
+  audit_append "${token_id}" "auth.login" "/v1/auth/login"
+  http_json 200 "${response}"
 }
 
 _handle_auth_revoke() {
-  # TODO: validate caller token, parse target token, auth_revoke, audit_append.
-  http_json 501 '{"error":"not implemented"}'
+  local body="${1}" token="${2}"
+  auth_validate "${token}" || { http_error 401 "unauthorized"; return; }
+  local target_token
+  target_token="$(_json_get_string "${body}" "token")"
+  [[ -z "${target_token}" ]] && { http_error 400 "missing token"; return; }
+  auth_revoke "${target_token}" || { http_error 404 "token not found"; return; }
+  audit_append "${AUTH_TOKEN_ID}" "auth.revoke" "/v1/auth/revoke"
+  http_json 204 ''
 }
 
 _handle_auth_self() {
-  # TODO: validate token, return auth_self output.
-  http_json 501 '{"error":"not implemented"}'
+  local token="${1}"
+  auth_validate "${token}" || { http_error 401 "unauthorized"; return; }
+  local response
+  response="$(auth_self "${token}")" || { http_error 401 "unauthorized"; return; }
+  audit_append "${AUTH_TOKEN_ID}" "auth.self" "/v1/auth/self"
+  http_json 200 "${response}"
 }
 
 _handle_policy_put() {
-  # TODO: validate root token, parse name from path, auth_policy_put, 201.
-  http_json 501 '{"error":"not implemented"}'
+  local route_path="${1}" body="${2}" token="${3}"
+  local name="${route_path#/v1/policies/}"
+  auth_validate "${token}" || { http_error 401 "unauthorized"; return; }
+  [[ "${AUTH_TOKEN_ID}" == "${_AUTH_ROOT_TOKEN_ID}" ]] || {
+    http_error 403 "forbidden"; return; }
+  [[ -z "${name}" || -z "${body}" ]] && { http_error 400 "missing policy"; return; }
+  auth_policy_put "${name}" "${body}"
+  audit_append "${AUTH_TOKEN_ID}" "policy.put" "policy/${name}"
+  http_json 201 '{"created":true}'
 }
 
 _handle_policy_get() {
-  # TODO: validate token, parse name from path, auth_policy_get.
-  http_json 501 '{"error":"not implemented"}'
+  local route_path="${1}" token="${2}"
+  local name="${route_path#/v1/policies/}"
+  auth_validate "${token}" || { http_error 401 "unauthorized"; return; }
+  local rules
+  rules="$(auth_policy_get "${name}")" || { http_error 404 "policy not found"; return; }
+  audit_append "${AUTH_TOKEN_ID}" "policy.get" "policy/${name}"
+  http_json 200 "${rules}"
 }
 
 _handle_lease_renew() {
@@ -227,6 +317,48 @@ _handle_lease_revoke() {
 }
 
 _handle_audit_query() {
-  # TODO: validate root token, parse token_id from query string, audit_query.
-  http_json 501 '{"error":"not implemented"}'
+  local query_string="${1}" token="${2}"
+  auth_validate "${token}" || { http_error 401 "unauthorized"; return; }
+  [[ "${AUTH_TOKEN_ID}" == "${_AUTH_ROOT_TOKEN_ID}" ]] || {
+    http_error 403 "forbidden"; return; }
+  local token_filter response
+  token_filter="$(_query_get "${query_string}" "token")"
+  response="$(audit_query "${token_filter}")"
+  audit_append "${AUTH_TOKEN_ID}" "audit.query" "/v1/audit"
+  http_json 200 "${response}"
+}
+
+_json_get_string() {
+  local json="${1}" key="${2}"
+  printf '%s' "${json}" | sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p"
+}
+
+_json_get_value() {
+  local json="${1}" key="${2}"
+  local string_value
+  string_value="$(_json_get_string "${json}" "${key}")"
+  if [[ -n "${string_value}" ]]; then
+    printf '%s' "${string_value}"
+    return
+  fi
+  printf '%s' "${json}" | sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\\(.*\\)[[:space:]]*}.*/\\1/p"
+}
+
+_json_quote() {
+  local value="${1}"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/\\n}"
+  printf '"%s"' "${value}"
+}
+
+_query_get() {
+  local query_string="${1}" key="${2}" part
+  IFS='&' read -ra parts <<< "${query_string}"
+  for part in "${parts[@]}"; do
+    if [[ "${part}" == "${key}="* ]]; then
+      printf '%s' "${part#*=}"
+      return
+    fi
+  done
 }

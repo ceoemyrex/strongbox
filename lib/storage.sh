@@ -9,6 +9,7 @@
 #   storage_init
 #   storage_put    <path> <envelope>    → version number (integer)
 #   storage_get    <path> [version]     → envelope string, or error on stderr
+#   storage_latest_version <path>       → latest version number, or error
 #   storage_delete <path>               → 0, or error on stderr
 #   storage_list   <prefix>             → newline-separated paths
 
@@ -49,6 +50,16 @@ storage_get() {
   fi
 
   echo "${envelope}"
+}
+
+storage_latest_version() {
+  local path="${1}"
+  local version="${_STORE_VERSION["${path}"]:-}"
+  if [[ -z "${version}" ]]; then
+    echo '{"error":"secret not found"}' >&2
+    return 1
+  fi
+  echo "${version}"
 }
 
 storage_delete() {

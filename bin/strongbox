@@ -20,7 +20,9 @@ CONFIG_FILE="${SCRIPT_DIR}/../config.yaml"
 
 # ── bootstrap ──────────────────────────────────────────────────────────────
 storage_init
+auth_init
 seal_init          # boots in sealed state; KEK = empty
+audit_init "${STRONGBOX_AUDIT_LOG_FILE:-/var/log/strongbox/audit.log}"
 consensus_init     # starts election timer; no writes until unsealed + leader
 lease_reaper_start # background loop; checks TTLs every LEASE_REAPER_INTERVAL
 
