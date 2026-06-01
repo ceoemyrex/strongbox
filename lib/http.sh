@@ -366,11 +366,12 @@ _h_internal_replicate() {
 _replicate_kv() {
   local key="$1" value="$2"
   IFS=' ' read -ra peers <<< "${STRONGBOX_PEERS:-}"
+  local payload; payload="$(python3 -c "import json,sys; print(json.dumps({'type':'kv','key':sys.argv[1],'value':sys.argv[2]}))" "${key}" "${value}")"
   for peer in "${peers[@]}"; do
     [[ -z "${peer}" ]] && continue
     curl -sf --max-time 1 -X POST "${peer}/internal/replicate" \
       -H 'Content-Type: application/json' \
-      -d "$(printf '{"type":"kv","key":"%s","value":"%s"}' "${key}" "${value}")" \
+      -d "${payload}" \
       >/dev/null 2>&1 &
   done
 }
