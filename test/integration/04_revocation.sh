@@ -15,8 +15,35 @@ expect_http() {
 
 echo "==> 04_revocation: Create token revoke token next request must be 401"
 
-# TODO: implement steps for this scenario.
-# Each step should call pass or fail.
+TEST_USERNAME="${STRONGBOX_TEST_USERNAME:-policy-reader}"
+TEST_PASSWORD="${STRONGBOX_TEST_PASSWORD:-policy-reader-password}"
+
+[[ -n "${ROOT_TOKEN}" ]] || fail "STRONGBOX_ROOT_TOKEN is required"
+
+code="$(curl -sk -o /tmp/strongbox_revoke_body.json -w "%{http_code}" \
+  -X POST "${BASE_URL}/v1/auth/login" \
+  -H "Content-Type: application/json" \
+  -d "{\"username\":\"${TEST_USERNAME}\",\"password\":\"${TEST_PASSWORD}\"}")"
+expect_http "login creates token" "200" "${code}"
+TOKEN="$(sed -n 's/.*"token":"\([^"]*\)".*/\1/p' /tmp/strongbox_revoke_body.json)"
+[[ -n "${TOKEN}" ]] && pass "login returned token" || fail "login did not return token"
+
+code="$(curl -sk -o /tmp/strongbox_revoke_body.json -w "%{http_code}" \
+  "${BASE_URL}/v1/auth/self" \
+  -H "Authorization: Bearer ${TOKEN}")"
+expect_http "fresh token works before revoke" "200" "${code}"
+
+code="$(curl -sk -o /tmp/strongbox_revoke_body.json -w "%{http_code}" \
+  -X POST "${BASE_URL}/v1/auth/revoke" \
+  -H "Authorization: Bearer ${ROOT_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d "{\"token\":\"${TOKEN}\"}")"
+expect_http "root revokes token" "204" "${code}"
+
+code="$(curl -sk -o /tmp/strongbox_revoke_body.json -w "%{http_code}" \
+  "${BASE_URL}/v1/auth/self" \
+  -H "Authorization: Bearer ${TOKEN}")"
+expect_http "revoked token fails immediately" "401" "${code}"
 
 echo "    ${PASS} passed / ${FAIL} failed"
 [[ "${FAIL}" -eq 0 ]] || exit 1
