@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# bin/http-handler — entry point for each ncat-forked request process
+#
+# ncat runs this script once per accepted TCP connection, with:
+#   stdin  = raw HTTP request bytes from the client
+#   stdout = raw HTTP response bytes to the client
+#
+# All heavy logic lives in lib/http.sh; this file just wires it up.
+
+set -uo pipefail
+
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "${APP_DIR}/lib/http.sh"
+http_handle_connection

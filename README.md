@@ -1,14 +1,15 @@
 # StrongBox
 
-## Tentative Architecture
-![Strongbox](./Strongbox.png)
-
 A distributed secrets manager built from first principles.
 Encryption, auth, leasing, leader election, and tamper-evident audit — all in Bash.
 
+## Architecture
+
+![Architecture](./docs/Strongbox.png)
+
 ## Public cluster URL
 
-> TODO: add your VPS domain/IP after provisioning
+> TODO: add your VPS domain/IP after provisioning (replace with real domain before grading)
 
 ## Quick start (fresh VPS)
 
@@ -37,10 +38,6 @@ curl -s -X POST https://yourdomain.com/v1/sys/unseal -d "{\"share\":\"$SHARE2\"}
 # 7. Verify unsealed
 curl -s https://yourdomain.com/v1/sys/health
 ```
-
-## Architecture
-
-See `docs/architecture.png`.
 
 ## Threat model
 
@@ -260,11 +257,254 @@ half after seal.
 
 ## Election protocol
 
-TODO: 200–400 word explanation of term numbers, vote rules, partition behaviour.
+StrongBox implements a simplified Raft-style leader election in `lib/consensus.sh`.
 
-## API examples
+**Term numbers.** Every node maintains a monotonically increasing term counter. A term is a logical clock: two nodes can only be in the same election if they share the same term. When a node starts an election it increments its term. If it receives a message from a higher term it immediately updates its own and reverts to follower.
 
-TODO: curl examples for each of the 10 grading scenarios.
+**Starting an election.** Every node runs a background election timer with a randomised timeout between 150 ms and 300 ms. If a follower has not received a heartbeat from the leader before its timer fires, it declares itself a candidate, increments its term, votes for itself, and sends `POST /internal/vote` to every peer with its term and node ID.
+
+**Vote granting.** A node grants at most one vote per term. It grants a vote to candidate `C` in term `T` if and only if: (a) `T` is strictly greater than the node's current term, and (b) the node has not yet voted in term `T`. Granting a vote resets the receiver's heartbeat timer so it does not start a competing election while the candidate is still collecting votes.
+
+**Winning the election.** A candidate that collects votes from a strict majority (⌊N/2⌋ + 1 out of N nodes) becomes leader and immediately sends heartbeats to all peers. With N=3, 2 votes win. Because each node votes for at most one candidate per term, two candidates cannot both win the same term — at most one leader exists per term.
+
+**Heartbeats.** The leader sends `POST /internal/heartbeat` to all followers every 50 ms. A heartbeat carries the leader's current term and node ID. Receiving a heartbeat from a node whose term is ≥ the receiver's current term resets the follower's election timer, updates its recorded leader, and reverts any in-progress election.
+
+**Partition behaviour (minority refuses writes).** Before accepting a write, a non-leader node checks whether it can reach a strict majority of peers via HTTP health checks (`consensus_quorum_reachable`). If a 2-node majority is partitioned away from a single follower, the follower counts only itself — below the quorum threshold of 2 — and refuses all write requests with HTTP 503. The majority partition elects a new leader among its reachable members within one election timeout and continues serving writes. When the partition heals, the minority node receives a heartbeat from the new leader, updates its term, reverts to follower, and rejoins without any manual intervention.
+
+**State persistence.** Because the election loop runs as a background subshell (forked from the main HTTP server), state changes (role, term, current leader) are written to shared temp files (`/tmp/sb_role.*`, `/tmp/sb_leader.*`, `/tmp/sb_term.*`) so the main shell's request handlers always read the current consensus state via `consensus_is_leader`, `consensus_leader_hint`, and `_consensus_read_term`.
+
+## Dynamic Postgres revocation when the DB is unreachable
+
+When a dynamic-postgres lease expires (or is revoked), `lease.sh` calls `dynamic_revoke_lease` to run `REVOKE` + `DROP ROLE` on the target Postgres. If Postgres is unreachable at that moment:
+
+1. The lease transitions to **`revocation_pending`** — never silently dropped.
+2. The background reaper retries on an exponential backoff schedule: 10s, 20s, 40s, … capped by `REVOCATION_MAX_BACKOFF` (default 3600s in `config.yaml`).
+3. Each retry calls `dynamic_revoke_lease` again until Postgres accepts the SQL.
+4. On success the lease moves to **`revoked`** and the username mapping is cleared from memory.
+
+This means a grader can stop Postgres, wait past the lease TTL, restart Postgres, and the role is removed automatically once connectivity returns — no manual `DROP ROLE` required.
+
+## API examples (all 10 grading scenarios)
+
+Set your base URL once:
+```bash
+BASE=https://yourdomain.com   # or http://localhost for local Docker testing
+```
+
+### Scenario 1 — cluster boots sealed
+
+```bash
+# Health shows sealed=true, no secret ops possible
+curl -s $BASE/v1/sys/health
+# {"sealed":true,"leader":"","term":0,"node_id":"node-1"}
+
+# Secret read blocked while sealed
+curl -s $BASE/v1/secrets/app/db
+# {"error":"vault is sealed"}
+```
+
+### Scenario 2 — unseal with K-of-N shares
+
+```bash
+# One-time init (save this output — shares are shown once only)
+INIT=$(curl -s -X POST $BASE/v1/sys/init)
+ROOT_TOKEN=$(echo $INIT | python3 -c "import json,sys; print(json.load(sys.stdin)['root_token'])")
+SHARE1=$(echo $INIT | python3 -c "import json,sys; print(json.load(sys.stdin)['shares'][0])")
+SHARE2=$(echo $INIT | python3 -c "import json,sys; print(json.load(sys.stdin)['shares'][1])")
+
+# Submit share 1 (progress 1/2)
+curl -s -X POST $BASE/v1/sys/unseal -H "Content-Type: application/json" \
+  -d "{\"share\":\"$SHARE1\"}"
+
+# Submit share 2 → unseals
+curl -s -X POST $BASE/v1/sys/unseal -H "Content-Type: application/json" \
+  -d "{\"share\":\"$SHARE2\"}"
+# {"sealed":false,"progress":"2/2"}
+
+# Verify
+curl -s $BASE/v1/sys/health
+# {"sealed":false,"leader":"node-1","term":1,"node_id":"node-1"}
+```
+
+### Scenario 3 — write, read, version
+
+```bash
+# Write version 1
+curl -s -X PUT $BASE/v1/secrets/app/db \
+  -H "Authorization: Bearer $ROOT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"data":{"user":"admin","password":"s3cr3t"}}'
+# {"version":1}
+
+# Read latest
+curl -s -H "Authorization: Bearer $ROOT_TOKEN" $BASE/v1/secrets/app/db
+# {"data":{"user":"admin","password":"s3cr3t"},"version":1,"lease":{...}}
+
+# Write version 2
+curl -s -X PUT $BASE/v1/secrets/app/db \
+  -H "Authorization: Bearer $ROOT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"data":{"user":"admin","password":"newpass"}}'
+# {"version":2}
+
+# Read version 1 explicitly
+curl -s -H "Authorization: Bearer $ROOT_TOKEN" "$BASE/v1/secrets/app/db?version=1"
+# {"data":{"user":"admin","password":"s3cr3t"},"version":1,...}
+```
+
+### Scenario 4 — token with scoped policy
+
+```bash
+# Create a policy that allows read on secret/app/* only
+curl -s -X PUT $BASE/v1/policies/app-reader \
+  -H "Authorization: Bearer $ROOT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"rules":[{"path":"app/*","capabilities":["read"]}]}'
+
+# Create a user with that policy
+curl -s -X POST $BASE/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"alice","password":"hunter2"}'
+# (first create alice via root — see admin workflow below)
+
+# With a scoped token:
+# READ secret/app/db → 200 OK
+curl -s -H "Authorization: Bearer $SCOPED_TOKEN" $BASE/v1/secrets/app/db
+
+# WRITE secret/app/db → 403 Forbidden
+curl -s -X PUT -H "Authorization: Bearer $SCOPED_TOKEN" $BASE/v1/secrets/app/db \
+  -H "Content-Type: application/json" -d '{"data":{"x":1}}'
+# {"error":"forbidden"}
+
+# READ secret/other/x → 403 Forbidden (outside policy path)
+curl -s -H "Authorization: Bearer $SCOPED_TOKEN" $BASE/v1/secrets/other/x
+# {"error":"forbidden"}
+```
+
+### Scenario 5 — revoke token → immediate 401
+
+```bash
+# Mint a token via login
+LOGIN=$(curl -s -X POST $BASE/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"alice","password":"hunter2"}')
+TOKEN=$(echo $LOGIN | python3 -c "import json,sys; print(json.load(sys.stdin)['token'])")
+
+# Revoke it
+curl -s -X POST $BASE/v1/auth/revoke \
+  -H "Authorization: Bearer $ROOT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"token\":\"$TOKEN\"}"
+
+# Next request with revoked token → 401 (no cache grace)
+curl -s -H "Authorization: Bearer $TOKEN" $BASE/v1/secrets/app/db
+# {"error":"unauthorized"}
+```
+
+### Scenario 6 — dynamic Postgres credentials
+
+```bash
+# Mint a fresh role (credentials valid for DYNAMIC_LEASE_TTL seconds)
+curl -s -H "Authorization: Bearer $ROOT_TOKEN" $BASE/v1/dynamic-postgres/readonly
+# {"username":"sb_a1b2c3d4...","password":"...","lease":{...}}
+
+# Verify role exists in pg_roles
+docker exec strongbox-postgres psql -U sbadmin -d strongbox \
+  -c "SELECT rolname FROM pg_roles WHERE rolname LIKE 'sb_%';"
+
+# Test the credential works
+docker exec strongbox-postgres psql \
+  "postgresql://<username>:<password>@localhost/strongbox" \
+  -c "SELECT * FROM demo_data;"
+```
+
+### Scenario 7 — Postgres down, lease expires, auto-cleanup
+
+```bash
+# Mint a credential (TTL = DYNAMIC_LEASE_TTL, default 60s in compose.yaml)
+CRED=$(curl -s -H "Authorization: Bearer $ROOT_TOKEN" $BASE/v1/dynamic-postgres/readonly)
+USERNAME=$(echo $CRED | python3 -c "import json,sys; print(json.load(sys.stdin)['username'])")
+
+# Stop Postgres (triggers revocation_pending on next reaper tick)
+docker stop strongbox-postgres
+
+# Wait past the lease TTL
+sleep 70
+
+# Restart Postgres (reaper retries with exponential backoff)
+docker start strongbox-postgres
+
+# Wait for a reaper retry cycle (~10-15s after restart)
+sleep 20
+
+# Verify role is gone — no manual DROP ROLE needed
+docker exec strongbox-postgres psql -U sbadmin -d strongbox \
+  -c "SELECT rolname FROM pg_roles WHERE rolname='$USERNAME';"
+# (0 rows)
+```
+
+### Scenario 8 — kill leader mid-write
+
+```bash
+# Find the current leader
+curl -s $BASE/v1/sys/health | python3 -c "import json,sys; print(json.load(sys.stdin)['leader'])"
+
+# Kill the leader container (e.g. node-1)
+docker kill strongbox-node-1
+
+# Write attempt → either succeeds under new leader, or fails cleanly (never double-ack)
+curl -s -X PUT $BASE/v1/secrets/app/db \
+  -H "Authorization: Bearer $ROOT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"data":{"kill":"test"}}'
+
+# New leader elected within 300ms
+sleep 1
+curl -s $BASE/v1/sys/health
+# {"sealed":false,"leader":"node-2",...}
+
+# Restart killed node
+docker start strongbox-node-1
+```
+
+### Scenario 9 — 2-1 partition
+
+```bash
+# Isolate node-3 (disconnect from the cluster network)
+docker network disconnect strongbox_cluster strongbox-node-3
+
+# Majority (node-1 + node-2) continues serving writes
+curl -s -X PUT $BASE/v1/secrets/app/db \
+  -H "Authorization: Bearer $ROOT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"data":{"partition":"majority"}}' 
+# {"version":N}
+
+# Minority (node-3) refuses writes
+curl -s -X PUT http://localhost:8203/v1/secrets/app/db \
+  -H "Authorization: Bearer $ROOT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"data":{"partition":"minority"}}'
+# {"error":"minority partition — writes refused"}
+
+# Heal partition
+docker network connect strongbox_cluster strongbox-node-3
+```
+
+### Scenario 10 — audit log tamper detection
+
+```bash
+# Tamper: flip one byte in the audit log
+docker exec strongbox-node-1 \
+  sed -i '3s/./X/' /var/log/strongbox/audit.log
+
+# Verify catches it and names the bad entry
+STRONGBOX_AUDIT_HMAC_KEY=<key-from-.env> \
+  docker exec -e STRONGBOX_AUDIT_HMAC_KEY strongbox-node-1 \
+  /opt/strongbox/bin/strongbox-verify /var/log/strongbox/audit.log
+# TAMPERED: audit entry index 3
+# exit code 1
+```
 
 ## Running tests
 

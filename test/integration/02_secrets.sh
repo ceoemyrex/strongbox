@@ -1,57 +1,47 @@
 #!/usr/bin/env bash
-# test/integration/02_secrets.sh — grading scenario: Write read and version retrieval
 set -euo pipefail
 
-BASE_URL="${STRONGBOX_URL:-https://localhost}"
+BASE_URL="${STRONGBOX_URL:-http://localhost:8201}"
 ROOT_TOKEN="${STRONGBOX_ROOT_TOKEN:-}"
 PASS=0; FAIL=0
 
 pass() { echo "    PASS: $*"; PASS=$(( PASS + 1 )); }
 fail() { echo "    FAIL: $*"; FAIL=$(( FAIL + 1 )); }
-expect_http() {
-  local label="$1" want="$2" got="$3"
-  [[ "$got" == "$want" ]] && pass "$label (HTTP $got)" || fail "$label — want $want got $got"
-}
 
-echo "==> 02_secrets: Write read and version retrieval"
+echo "==> 02_secrets: Write, read, and version retrieval"
 
-[[ -n "${ROOT_TOKEN}" ]] || fail "STRONGBOX_ROOT_TOKEN is required"
+[[ -n "${ROOT_TOKEN}" ]] || { fail "STRONGBOX_ROOT_TOKEN required"; echo "    ${PASS} passed / ${FAIL} failed"; exit 1; }
 
-write_secret() {
-  local value="$1"
-  curl -sk -o /tmp/strongbox_secret_body.json -w "%{http_code}" \
-    -X PUT "${BASE_URL}/v1/secrets/secret/app/db" \
-    -H "Authorization: Bearer ${ROOT_TOKEN}" \
-    -H "Content-Type: application/json" \
-    -d "{\"data\":\"${value}\"}"
-}
+code="$(curl -sk -o /tmp/sb_w1.json -w "%{http_code}" \
+  -X PUT "${BASE_URL}/v1/secrets/app/db" \
+  -H "Authorization: Bearer ${ROOT_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"data":{"user":"admin","password":"s3cr3t"}}')"
+[[ "${code}" == "201" ]] && pass "write v1 (201)" || fail "write v1 returned ${code}"
+grep -q '"version":1' /tmp/sb_w1.json && pass "version 1 returned" || fail "version 1 not returned"
 
-read_secret() {
-  local suffix="${1:-}"
-  curl -sk -o /tmp/strongbox_secret_body.json -w "%{http_code}" \
-    "${BASE_URL}/v1/secrets/secret/app/db${suffix}" \
-    -H "Authorization: Bearer ${ROOT_TOKEN}"
-}
+code="$(curl -sk -o /tmp/sb_w2.json -w "%{http_code}" \
+  -X PUT "${BASE_URL}/v1/secrets/app/db" \
+  -H "Authorization: Bearer ${ROOT_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"data":{"user":"admin","password":"newpass"}}')"
+[[ "${code}" == "201" ]] && pass "write v2 (201)" || fail "write v2 returned ${code}"
+grep -q '"version":2' /tmp/sb_w2.json && pass "version 2 returned" || fail "version 2 not returned"
 
-code="$(write_secret "postgres://v1")"
-expect_http "first write creates version" "201" "${code}"
-grep -q '"version":1' /tmp/strongbox_secret_body.json && pass "first write returned version 1" || fail "first write did not return version 1"
+code="$(curl -sk -o /tmp/sb_r.json -w "%{http_code}" \
+  -H "Authorization: Bearer ${ROOT_TOKEN}" "${BASE_URL}/v1/secrets/app/db")"
+[[ "${code}" == "200" ]] && pass "read latest (200)" || fail "read latest returned ${code}"
+grep -q '"password":"newpass"' /tmp/sb_r.json && pass "latest is v2" || fail "latest is not v2"
 
-code="$(write_secret "postgres://v2")"
-expect_http "second write creates version" "201" "${code}"
-grep -q '"version":2' /tmp/strongbox_secret_body.json && pass "second write returned version 2" || fail "second write did not return version 2"
+code="$(curl -sk -o /tmp/sb_rv1.json -w "%{http_code}" \
+  -H "Authorization: Bearer ${ROOT_TOKEN}" "${BASE_URL}/v1/secrets/app/db?version=1")"
+[[ "${code}" == "200" ]] && pass "read v1 (200)" || fail "read v1 returned ${code}"
+grep -q '"password":"s3cr3t"' /tmp/sb_rv1.json && pass "v1 has original password" || fail "v1 data mismatch"
 
-code="$(read_secret "")"
-expect_http "latest read succeeds" "200" "${code}"
-grep -q '"data":"postgres://v2"' /tmp/strongbox_secret_body.json && pass "latest read returned v2" || fail "latest read did not return v2"
-
-code="$(read_secret "?version=1")"
-expect_http "version 1 read succeeds" "200" "${code}"
-grep -q '"data":"postgres://v1"' /tmp/strongbox_secret_body.json && pass "version 1 read returned v1" || fail "version 1 read did not return v1"
-
-code="$(read_secret "?version=2")"
-expect_http "version 2 read succeeds" "200" "${code}"
-grep -q '"data":"postgres://v2"' /tmp/strongbox_secret_body.json && pass "version 2 read returned v2" || fail "version 2 read did not return v2"
+code="$(curl -sk -o /tmp/sb_rv2.json -w "%{http_code}" \
+  -H "Authorization: Bearer ${ROOT_TOKEN}" "${BASE_URL}/v1/secrets/app/db?version=2")"
+[[ "${code}" == "200" ]] && pass "read v2 (200)" || fail "read v2 returned ${code}"
+grep -q '"password":"newpass"' /tmp/sb_rv2.json && pass "v2 has new password" || fail "v2 data mismatch"
 
 echo "    ${PASS} passed / ${FAIL} failed"
 [[ "${FAIL}" -eq 0 ]] || exit 1

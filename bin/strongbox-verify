@@ -1,7 +1,4 @@
 #!/usr/bin/env bash
-# strongbox-verify — audit log verifier
-# Usage: strongbox-verify <audit-log-file>
-# Exits 0 if the chain is intact; non-zero and names the bad entry if not.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
