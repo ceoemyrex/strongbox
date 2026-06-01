@@ -133,19 +133,14 @@ services:
   nginx:
     image: nginx:alpine
     container_name: strongbox-nginx
-    command: >
-      sh -c "mkdir -p /etc/nginx/ssl &&
-             apk add --no-cache openssl > /dev/null 2>&1 &&
-             openssl req -x509 -nodes -days 365 -newkey rsa:2048
-               -keyout /etc/nginx/ssl/selfsigned.key
-               -out /etc/nginx/ssl/selfsigned.crt
-               -subj '/CN=strongbox' > /dev/null 2>&1 &&
-             nginx -g 'daemon off;'"
+    command: nginx -g 'daemon off;'
     ports:
       - "80:80"
       - "443:443"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - /etc/letsencrypt/live/strong-box.duckdns.org/fullchain.pem:/etc/nginx/ssl/selfsigned.crt:ro
+      - /etc/letsencrypt/live/strong-box.duckdns.org/privkey.pem:/etc/nginx/ssl/selfsigned.key:ro
     networks: [cluster]
     depends_on: [strongbox-node-1, strongbox-node-2, strongbox-node-3]
     restart: unless-stopped
