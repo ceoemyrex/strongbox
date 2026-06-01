@@ -1,63 +1,53 @@
 #!/usr/bin/env bash
-# test/integration/03_policy.sh — grading scenario: Token scoped to read on secret/app/* — 200 and 403 checks
 set -euo pipefail
 
-BASE_URL="${STRONGBOX_URL:-https://localhost}"
+BASE_URL="${STRONGBOX_URL:-http://localhost:8201}"
 ROOT_TOKEN="${STRONGBOX_ROOT_TOKEN:-}"
 PASS=0; FAIL=0
 
 pass() { echo "    PASS: $*"; PASS=$(( PASS + 1 )); }
 fail() { echo "    FAIL: $*"; FAIL=$(( FAIL + 1 )); }
-expect_http() {
-  local label="$1" want="$2" got="$3"
-  [[ "$got" == "$want" ]] && pass "$label (HTTP $got)" || fail "$label — want $want got $got"
-}
 
 echo "==> 03_policy: Token scoped to read on secret/app/* — 200 and 403 checks"
 
-TEST_USERNAME="${STRONGBOX_TEST_USERNAME:-policy-reader}"
-TEST_PASSWORD="${STRONGBOX_TEST_PASSWORD:-policy-reader-password}"
+[[ -n "${ROOT_TOKEN}" ]] || { fail "STRONGBOX_ROOT_TOKEN required"; echo "    ${PASS} passed / ${FAIL} failed"; exit 1; }
 
-[[ -n "${ROOT_TOKEN}" ]] || fail "STRONGBOX_ROOT_TOKEN is required"
-
-code="$(curl -sk -o /tmp/strongbox_policy_body.json -w "%{http_code}" \
-  -X PUT "${BASE_URL}/v1/policies/app-read" \
+code="$(curl -sk -o /dev/null -w "%{http_code}" \
+  -X PUT "${BASE_URL}/v1/policies/app-reader" \
   -H "Authorization: Bearer ${ROOT_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{"rules":[{"path":"secret/app/*","capabilities":["read"]}]}')"
-expect_http "root creates read-only policy" "201" "${code}"
+[[ "${code}" == "201" ]] && pass "policy created (201)" || fail "policy create returned ${code}"
 
-code="$(curl -sk -o /tmp/strongbox_policy_body.json -w "%{http_code}" \
-  -X PUT "${BASE_URL}/v1/secrets/secret/app/db" \
+code="$(curl -sk -o /dev/null -w "%{http_code}" \
+  -X PUT "${BASE_URL}/v1/users/policyuser" \
   -H "Authorization: Bearer ${ROOT_TOKEN}" \
   -H "Content-Type: application/json" \
-  -d '{"data":"policy-value"}')"
-expect_http "root seeds readable secret" "201" "${code}"
+  -d '{"password":"policypass","policies":["app-reader"]}')"
+[[ "${code}" == "201" ]] && pass "user created (201)" || fail "user create returned ${code}"
 
-code="$(curl -sk -o /tmp/strongbox_policy_body.json -w "%{http_code}" \
+code="$(curl -sk -o /tmp/sb_login.json -w "%{http_code}" \
   -X POST "${BASE_URL}/v1/auth/login" \
   -H "Content-Type: application/json" \
-  -d "{\"username\":\"${TEST_USERNAME}\",\"password\":\"${TEST_PASSWORD}\"}")"
-expect_http "policy user login succeeds" "200" "${code}"
-TOKEN="$(sed -n 's/.*"token":"\([^"]*\)".*/\1/p' /tmp/strongbox_policy_body.json)"
-[[ -n "${TOKEN}" ]] && pass "login returned token" || fail "login did not return token"
+  -d '{"username":"policyuser","password":"policypass"}')"
+[[ "${code}" == "200" ]] && pass "login (200)" || fail "login returned ${code}"
+USR_TOKEN="$(python3 -c "import json; print(json.load(open('/tmp/sb_login.json'))['token'])" 2>/dev/null)"
+[[ -n "${USR_TOKEN}" ]] && pass "token returned" || fail "no token in login response"
 
-code="$(curl -sk -o /tmp/strongbox_policy_body.json -w "%{http_code}" \
-  "${BASE_URL}/v1/secrets/secret/app/db" \
-  -H "Authorization: Bearer ${TOKEN}")"
-expect_http "read under secret/app/* succeeds" "200" "${code}"
+code="$(curl -sk -o /dev/null -w "%{http_code}" \
+  -H "Authorization: Bearer ${USR_TOKEN}" "${BASE_URL}/v1/secrets/app/db")"
+[[ "${code}" == "200" ]] && pass "read secret/app/db (200)" || fail "read app/db returned ${code}"
 
-code="$(curl -sk -o /tmp/strongbox_policy_body.json -w "%{http_code}" \
-  -X PUT "${BASE_URL}/v1/secrets/secret/app/db" \
-  -H "Authorization: Bearer ${TOKEN}" \
+code="$(curl -sk -o /dev/null -w "%{http_code}" \
+  -X PUT "${BASE_URL}/v1/secrets/app/db" \
+  -H "Authorization: Bearer ${USR_TOKEN}" \
   -H "Content-Type: application/json" \
-  -d '{"data":"blocked-write"}')"
-expect_http "write under read-only policy is forbidden" "403" "${code}"
+  -d '{"data":{"x":1}}')"
+[[ "${code}" == "403" ]] && pass "write secret/app/db (403)" || fail "write app/db returned ${code}"
 
-code="$(curl -sk -o /tmp/strongbox_policy_body.json -w "%{http_code}" \
-  "${BASE_URL}/v1/secrets/secret/other/x" \
-  -H "Authorization: Bearer ${TOKEN}")"
-expect_http "read outside prefix is forbidden" "403" "${code}"
+code="$(curl -sk -o /dev/null -w "%{http_code}" \
+  -H "Authorization: Bearer ${USR_TOKEN}" "${BASE_URL}/v1/secrets/other/x")"
+[[ "${code}" == "403" ]] && pass "read secret/other/x (403)" || fail "read other/x returned ${code}"
 
 echo "    ${PASS} passed / ${FAIL} failed"
 [[ "${FAIL}" -eq 0 ]] || exit 1

@@ -9,8 +9,9 @@ set -euo pipefail
 
 _NODE_ID="${STRONGBOX_NODE_ID:-node-1}"
 _PEERS=()
-_ELECTION_TIMEOUT_MIN_MS=500
-_ELECTION_TIMEOUT_MAX_MS=1000
+_HEARTBEAT_INTERVAL_MS=200
+_ELECTION_TIMEOUT_MIN_MS=1000
+_ELECTION_TIMEOUT_MAX_MS=2000
 _CS_DIR="${_CS_DIR:-/dev/shm/strongbox/consensus}"
 
 _now_ms() { date +%s%3N; }
@@ -60,13 +61,13 @@ _consensus_election_loop() {
   fi
 
   while true; do
-    local range=$(( _ELECTION_TIMEOUT_MAX_MS - _ELECTION_TIMEOUT_MIN_MS ))
-    local tms=$(( (RANDOM % range) + _ELECTION_TIMEOUT_MIN_MS ))
-    sleep "$(echo "scale=3; ${tms}/1000" | bc)"
-
     if [[ "$(_cs_read role)" == "leader" ]]; then
+      sleep "$(echo "scale=3; ${_HEARTBEAT_INTERVAL_MS}/1000" | bc)"
       _consensus_send_heartbeats
     else
+      local range=$(( _ELECTION_TIMEOUT_MAX_MS - _ELECTION_TIMEOUT_MIN_MS ))
+      local tms=$(( (RANDOM % range) + _ELECTION_TIMEOUT_MIN_MS ))
+      sleep "$(echo "scale=3; ${tms}/1000" | bc)"
       local now last_hb; now="$(_now_ms)"; last_hb="$(_cs_read last_hb)"; last_hb="${last_hb:-0}"
       if (( now - last_hb >= tms )); then _consensus_start_election; fi
     fi

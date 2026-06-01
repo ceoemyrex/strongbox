@@ -21,12 +21,9 @@ auth_bootstrap_root() {
 
 auth_user_create() {
   local username="$1" password="$2" policies="${3:-[]}"
-  local hash
-  hash="$(printf '%s' "${password}" | python3 -c "
-import sys
-from argon2 import PasswordHasher
-ph = PasswordHasher(time_cost=3, memory_cost=4096, parallelism=1)
-print(ph.hash(sys.stdin.read()))" 2>/dev/null)"
+  local salt hash
+  salt="$(openssl rand -hex 16)"
+  hash="$(printf '%s' "${password}" | argon2 "${salt}" -id -t 3 -m 16 -p 1 -l 32 -e 2>/dev/null)"
   storage_kv_put "user:${username}:hash" "${hash}"
   storage_kv_put "user:${username}:policies" "${policies}"
 }
@@ -39,17 +36,16 @@ auth_login() {
   }
 
   local valid
-  valid="$(printf '%s\n%s' "${stored_hash}" "${password}" | python3 -c "
+  valid="$(python3 - "${password}" "${stored_hash}" <<'PY'
 import sys
 from argon2 import PasswordHasher
-from argon2.exceptions import VerifyMismatchError
-lines = sys.stdin.read().split('\n', 1)
-ph = PasswordHasher(time_cost=3, memory_cost=4096, parallelism=1)
 try:
-    ph.verify(lines[0], lines[1])
-    print('ok')
-except (VerifyMismatchError, Exception):
-    print('fail')" 2>/dev/null)"
+    PasswordHasher().verify(sys.argv[2], sys.argv[1])
+    print("ok")
+except Exception:
+    print("fail")
+PY
+)"
   [[ "${valid}" != "ok" ]] && { echo '{"error":"invalid credentials"}'; return 1; }
 
   local token token_id policies

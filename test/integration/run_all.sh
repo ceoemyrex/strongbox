@@ -1,16 +1,11 @@
 #!/usr/bin/env bash
-# test/integration/run_all.sh
-# Runs all 10 grading scenarios in sequence. No manual intervention between them.
-#
-# Usage:
-#   export STRONGBOX_URL=https://yourdomain.com
-#   export STRONGBOX_ROOT_TOKEN=<root token from sys/init>
-#   bash test/integration/run_all.sh
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TOTAL=0
 FAILED=0
+
+export STRONGBOX_URL="${STRONGBOX_URL:-http://localhost:8201}"
 
 run() {
   local script="$1"
@@ -25,6 +20,11 @@ run() {
 }
 
 run "${DIR}/00_init.sh"
+
+if [[ -f /tmp/sb_init.json ]]; then
+  export STRONGBOX_ROOT_TOKEN="$(python3 -c "import json; print(json.load(open('/tmp/sb_init.json'))['root_token'])")"
+fi
+
 run "${DIR}/01_unseal.sh"
 run "${DIR}/02_secrets.sh"
 run "${DIR}/03_policy.sh"

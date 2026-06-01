@@ -95,7 +95,12 @@ _http_route() {
       case "${path}" in
         /v1/sys/*|/internal/*|/v1/auth/login) ;;
         *)
-          consensus_quorum_reachable 2>/dev/null || { http_error 503 "minority partition — writes refused"; return; } ;;
+          local role; role="$(_cs_read role 2>/dev/null || echo follower)"
+          if [[ "${role}" != "leader" ]]; then
+            consensus_quorum_reachable 2>/dev/null || { http_error 503 "minority partition — writes refused"; return; }
+            http_json 307 "$(printf '{"error":"not leader","leader":"%s"}' "$(consensus_leader_hint 2>/dev/null)")"
+            return
+          fi ;;
       esac ;;
   esac
 
