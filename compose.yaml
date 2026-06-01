@@ -1,0 +1,119 @@
+name: strongbox
+
+# Environment variables required in .env:
+#   PG_PASSWORD  — Postgres superuser password
+#   DOMAIN       — your public domain for TLS cert paths
+
+services:
+
+  strongbox-node-1:
+    build: .
+    container_name: strongbox-node-1
+    environment:
+      STRONGBOX_NODE_ID:      node-1
+      STRONGBOX_PORT:         "8200"
+      STRONGBOX_PEERS:        "http://strongbox-node-2:8200 http://strongbox-node-3:8200"
+      STRONGBOX_PG_DSN:       "postgresql://sbadmin:${PG_PASSWORD}@postgres:5432/strongbox"
+      LEASE_DEFAULT_TTL:      "3600"
+      LEASE_MAX_TTL:          "86400"
+      LEASE_REAPER_INTERVAL:  "10"
+      REVOCATION_MAX_BACKOFF: "3600"
+    volumes:
+      - ./config.yaml:/etc/strongbox/config.yaml:ro
+      - node1-audit:/var/log/strongbox
+    networks: [cluster]
+    depends_on: [postgres]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8200/v1/sys/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  strongbox-node-2:
+    build: .
+    container_name: strongbox-node-2
+    environment:
+      STRONGBOX_NODE_ID:      node-2
+      STRONGBOX_PORT:         "8200"
+      STRONGBOX_PEERS:        "http://strongbox-node-1:8200 http://strongbox-node-3:8200"
+      STRONGBOX_PG_DSN:       "postgresql://sbadmin:${PG_PASSWORD}@postgres:5432/strongbox"
+      LEASE_DEFAULT_TTL:      "3600"
+      LEASE_MAX_TTL:          "86400"
+      LEASE_REAPER_INTERVAL:  "10"
+      REVOCATION_MAX_BACKOFF: "3600"
+    volumes:
+      - ./config.yaml:/etc/strongbox/config.yaml:ro
+      - node2-audit:/var/log/strongbox
+    networks: [cluster]
+    depends_on: [postgres]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8200/v1/sys/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  strongbox-node-3:
+    build: .
+    container_name: strongbox-node-3
+    environment:
+      STRONGBOX_NODE_ID:      node-3
+      STRONGBOX_PORT:         "8200"
+      STRONGBOX_PEERS:        "http://strongbox-node-1:8200 http://strongbox-node-2:8200"
+      STRONGBOX_PG_DSN:       "postgresql://sbadmin:${PG_PASSWORD}@postgres:5432/strongbox"
+      LEASE_DEFAULT_TTL:      "3600"
+      LEASE_MAX_TTL:          "86400"
+      LEASE_REAPER_INTERVAL:  "10"
+      REVOCATION_MAX_BACKOFF: "3600"
+    volumes:
+      - ./config.yaml:/etc/strongbox/config.yaml:ro
+      - node3-audit:/var/log/strongbox
+    networks: [cluster]
+    depends_on: [postgres]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8200/v1/sys/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: strongbox-postgres
+    environment:
+      POSTGRES_USER:     sbadmin
+      POSTGRES_PASSWORD: "${PG_PASSWORD}"
+      POSTGRES_DB:       strongbox
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks: [cluster]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sbadmin -d strongbox"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  nginx:
+    image: nginx:alpine
+    container_name: strongbox-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+    networks: [cluster]
+    depends_on: [strongbox-node-1, strongbox-node-2, strongbox-node-3]
+    restart: unless-stopped
+
+networks:
+  cluster:
+    driver: bridge
+
+volumes:
+  node1-audit:
+  node2-audit:
+  node3-audit:
+  pgdata:

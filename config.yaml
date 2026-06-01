@@ -1,0 +1,34 @@
+# config.yaml — all tuneable values live here.
+# No hardcoded thresholds anywhere in .sh files.
+
+server:
+  port: 8200
+  node_id: "${STRONGBOX_NODE_ID}"
+
+cluster:
+  peers:
+    - "http://strongbox-node-2:8200"
+    - "http://strongbox-node-3:8200"
+
+shamir:
+  threshold: 2   # K — minimum shares required to unseal
+  shares:    3   # N — total shares generated at init
+
+election:
+  timeout_min_ms:        150
+  timeout_max_ms:        300
+  heartbeat_interval_ms: 50
+
+leases:
+  default_ttl:      3600   # seconds
+  max_ttl:          86400  # seconds
+  reaper_interval:  10     # seconds
+
+dynamic_postgres:
+  dsn:                 "${STRONGBOX_PG_DSN}"
+  default_lease_ttl:   3600
+  max_lease_ttl:       86400
+  revocation_max_backoff: 3600  # retry ceiling before marking unrecoverable
+
+audit:
+  log_file: "/var/log/strongbox/audit.log"
