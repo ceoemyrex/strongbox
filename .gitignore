@@ -1,7 +1,5 @@
 .env
 *.log
 init.json
-screenshots/*.png
-docs/architecture.png
 .DS_Store
 __pycache__/
