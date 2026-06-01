@@ -59,12 +59,19 @@ _http_handle_connection() {
     esac
   fi
 
-  # ── gate: leader (writes only) ────────────────────────────────────────
+  # ── gate: leader (writes only, excluding /sys/* bootstrap paths) ──────
+  # /sys/init, /sys/unseal, /sys/seal are NOT consensus writes — they
+  # manipulate per-node state (KEK in memory). The operator must be able
+  # to call them on any node, especially before unseal when leader
+  # election may not have produced a stable leader yet.
   local write_method=false
   [[ "${method}" == "PUT" || "${method}" == "POST" || \
      "${method}" == "DELETE" ]] && write_method=true
 
-  if ${write_method} && ! consensus_is_leader; then
+  local is_sys_path=false
+  [[ "${path}" == /v1/sys/* ]] && is_sys_path=true
+
+  if ${write_method} && ! ${is_sys_path} && ! consensus_is_leader; then
     # Minority partition: refuse entirely.
     if ! consensus_quorum_reachable; then
       http_json 503 '{"error":"minority partition — writes refused"}'; return
@@ -142,23 +149,104 @@ http_error() {
 # Each stub maps to a grading scenario. Implement one at a time.
 
 _handle_sys_init() {
-  # TODO: generate KEK, split into N Shamir shares, return shares + root token.
-  # POST /v1/sys/init → {shares:[...], root_token:"..."} (one-time only)
-  http_json 501 '{"error":"not implemented"}'
+  # POST /v1/sys/init — one-time cluster bootstrap.
+  # Generates the KEK pair, splits into N Shamir shares via shamir.py,
+  # generates a root token, and returns shares + root token to the operator.
+  # Cluster remains SEALED — operator must submit K shares to unseal.
+  #
+  # Idempotency: seal_init_cluster rejects subsequent calls with
+  # {"error":"already initialized"}. The cluster never re-issues shares.
+  #
+  # CRITICAL: do NOT capture seal_init_cluster output via $() — that forks
+  # a subshell and _INITIALIZED=true would be lost in the parent process.
+  # Read _SEAL_RESPONSE after the call instead.
+  seal_init_cluster || true
+  local response="${_SEAL_RESPONSE}"
+
+  # If seal_init_cluster rejected (already initialized), return 409.
+  if echo "${response}" | grep -q '"error"'; then
+    http_json 409 "${response}"
+  else
+    http_json 200 "${response}"
+  fi
 }
 
 _handle_sys_unseal() {
+  # POST /v1/sys/unseal {share} — submit one share.
+  # When K shares collected, vault transitions sealed → unsealed.
+  #
+  # Body format: {"share":"x:hexbytes"}
   local body="${1}"
-  local share; share="$(echo "${body}" | grep -o '"share":"[^"]*"' | cut -d\" -f4)"
-  local result; result="$(seal_submit_share "${share}")"
-  http_json 200 "${result}"
+  local share
+  share="$(echo "${body}" | grep -o '"share":"[^"]*"' | cut -d\" -f4)"
+
+  if [ -z "${share}" ]; then
+    http_error 400 "missing share in request body"
+    return
+  fi
+
+  # CRITICAL: subshell capture would lose _SHARES_COLLECTED mutation.
+  # Call directly; read _SEAL_RESPONSE; then explicitly zero the local share.
+  seal_submit_share "${share}" || true
+  local response="${_SEAL_RESPONSE}"
+
+  # Zero the share local immediately — caller-side memory hygiene.
+  # The HTTP handler held the raw share value; that local must not persist.
+  local zero
+  zero="$(head -c "${#share}" /dev/zero | tr '\0' '0')"
+  share="${zero}"
+  share=""
+
+  # Status code selection:
+  #   200 — share accepted (progress reported, or unsealed)
+  #   400 — malformed share
+  #   409 — duplicate share OR already unsealed OR not initialized
+  case "${response}" in
+    *'"error"'*'malformed'*)         http_json 400 "${response}" ;;
+    *'"error"'*'duplicate'*)         http_json 409 "${response}" ;;
+    *'"error"'*'already unsealed'*)  http_json 409 "${response}" ;;
+    *'"error"'*'not initialized'*)   http_json 409 "${response}" ;;
+    *'"error"'*'reconstruction'*)    http_json 400 "${response}" ;;
+    *)                                http_json 200 "${response}" ;;
+  esac
 }
 
 _handle_sys_seal() {
+  # POST /v1/sys/seal — purge KEK, return to sealed state.
+  # Requires authentication: only an authorised caller can re-seal the vault.
   local token="${1}"
-  auth_validate "${token}" || { http_error 401 "unauthorized"; return; }
+
+  # Sealing while sealed is a no-op error.
+  if seal_is_sealed; then
+    http_json 409 '{"error":"vault is already sealed"}'
+    return
+  fi
+
+  if [ -z "${token}" ]; then
+    http_error 401 "unauthorized — bearer token required"
+    return
+  fi
+
+  # Auth check. Until auth.sh is fully wired we accept the root token as
+  # a fallback so this endpoint is testable. Once auth_validate is in
+  # place the root-token path becomes redundant but harmless.
+  local authed=false
+  if declare -f auth_validate >/dev/null 2>&1; then
+    auth_validate "${token}" && authed=true
+  fi
+  if ! ${authed} && [ "${token}" = "$(seal_get_root_token)" ]; then
+    authed=true
+  fi
+  if ! ${authed}; then
+    http_error 401 "unauthorized — invalid bearer token"
+    return
+  fi
+
+  # TODO once audit.sh is fully wired: audit_append "${AUTH_TOKEN_ID:-root}" "seal" "/sys/seal"
   seal_seal
-  http_json 204 ''
+
+  # 204 No Content — sys/seal returns no body per the spec.
+  printf 'HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n'
 }
 
 _handle_sys_health() {
