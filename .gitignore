@@ -1,0 +1,5 @@
+.env
+*.log
+init.json
+screenshots/*.png
+docs/architecture.png

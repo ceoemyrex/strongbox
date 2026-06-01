@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# strongbox — main server entrypoint
+# Starts the HTTP server, initialises all subsystems, runs the reaper loop.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="${SCRIPT_DIR}/../lib"
+
+source "${LIB_DIR}/seal.sh"
+source "${LIB_DIR}/crypto.sh"
+source "${LIB_DIR}/storage.sh"
+source "${LIB_DIR}/auth.sh"
+source "${LIB_DIR}/audit.sh"
+source "${LIB_DIR}/lease.sh"
+source "${LIB_DIR}/dynamic.sh"
+source "${LIB_DIR}/consensus.sh"
+source "${LIB_DIR}/http.sh"
+
+CONFIG_FILE="${SCRIPT_DIR}/../config.yaml"
+
+# ── bootstrap ──────────────────────────────────────────────────────────────
+storage_init
+seal_init          # boots in sealed state; KEK = empty
+consensus_init     # starts election timer; no writes until unsealed + leader
+lease_reaper_start # background loop; checks TTLs every LEASE_REAPER_INTERVAL
+
+# ── main request loop ───────────────────────────────────────────────────────
+# http_serve blocks; dispatches each request to the correct handler.
+# All handlers receive: method, path, body, token (may be empty).
+http_serve

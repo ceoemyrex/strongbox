@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# strongbox-verify — audit log verifier
+# Usage: strongbox-verify <audit-log-file>
+# Exits 0 if the chain is intact; non-zero and names the bad entry if not.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="${SCRIPT_DIR}/../lib"
+
+source "${LIB_DIR}/audit.sh"
+
+LOG_FILE="${1:-}"
+if [[ -z "${LOG_FILE}" ]]; then
+  echo "usage: strongbox-verify <audit-log-file>" >&2
+  exit 1
+fi
+
+if [[ ! -f "${LOG_FILE}" ]]; then
+  echo "error: file not found: ${LOG_FILE}" >&2
+  exit 1
+fi
+
+audit_verify "${LOG_FILE}"
