@@ -10,6 +10,7 @@ Encryption, auth, leasing, leader election, and tamper-evident audit — all in 
 ## Public cluster URL
 
 **https://strong-box.duckdns.org**
+**https://strong-box.duckdns.org/v1/sys/health**
 
 ## Quick start (fresh VPS)
 
